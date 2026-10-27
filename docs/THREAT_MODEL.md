@@ -28,6 +28,58 @@ hidden in data it read), a malicious or compromised client, a curious insider.
 - Startup refuses a DB role with superuser, create-role/db, replication, bypass-RLS or any
   INSERT/UPDATE/DELETE/TRUNCATE grant.
 
+## Phase 4 writes, approvals and audit
+- Writes are OFF by default (`GATEWAY_READ_ONLY=true`). Turning them on requires the write
+  role, the approval store and the durable audit trail (startup refuses otherwise). A write is
+  refused if the global switch OR the role is read-only, and the DB role is a second layer
+  (column-level UPDATE grants; DELETE only on `orders`; no superuser/createrole/bypassrls).
+- `update_record` / `delete_record`: one row by single-column primary key, policy-listed
+  `writable_columns` / `deletable` tables only, supported column types only. SQL comes from
+  SQLAlchemy Core constructs (identifiers quoted, values bound). Anything but exactly one
+  affected row rolls back. `dry_run` executes then rolls back; sequences/triggers are not
+  rolled back, and it still needs the write role and policy checks.
+- Risk: unknown tool = high. High risk always needs approval; a role may also require it for
+  lower tiers (`approval_required`).
+- Approvals: bound to SHA-256 of canonical {tool, args}, the requester and the exact call;
+  expire by the DB clock; single-use. Every transition is one atomic `UPDATE ... WHERE
+  <guards> RETURNING`, so concurrent consumers or deciders get exactly one winner (tested with
+  25 concurrent consumers). The requester cannot decide: refused in the UPDATE and again by a
+  CHECK constraint, and `require_different_approver` cannot be disabled in policy.
+- Consume happens BEFORE execute (at-most-once): if the write then fails, the approval is
+  spent and a new one is needed. An approval can never run twice.
+- Approvers see the real arguments (stored in the gateway DB, access-controlled). Logs and
+  audit rows keep column NAMES only for `changes`; SQL is hashed; secrets are redacted.
+- Audit: JSON log plus `audit_log` row for every stage. The `allow` record is persisted before
+  a write runs; if it cannot be, the write is refused. Reads/denials degrade to the JSON log
+  if the audit DB is down. The audit role is INSERT-only (tested), so a compromised gateway
+  cannot rewrite history; approvals role cannot touch audit_log or delete approvals.
+- Hardening from review (migration 0002): `gateway_app` may update only the decision/usage
+  columns of `approvals` (never `args_hash`, `requester`, `tool`, `expires_at`); a trigger
+  allows only pending->approved|denied and approved->used|denied, binds the table owner too,
+  and forbids editing identity columns; a partial unique index allows one live approval per
+  (requester, exact call), so concurrent identical requests collapse to one row. A requester
+  may hold at most 5 live approvals (queue flooding); stale rows are retired on the next
+  create. Stored arguments are cleared once an approval is used or denied. A pending approval
+  whose audit record cannot be written is cancelled; an audit outage before execution does not
+  spend an approval (the record is written before the approval is consumed).
+- Policy: a tool in two risk tiers is a load error; `delete_record`/`bulk_update` must be high
+  and are floored to high in code; the highest tier wins on any overlap. The primary key is
+  never a writable column.
+- Startup refuses to run unless the schema is at the Alembic head, ro/rw/approvals/audit are
+  four different DB users, the audit role can only INSERT into `audit_log`, the approvals role
+  has no rights on `audit_log` and cannot DELETE/TRUNCATE approvals, none of them is a
+  superuser/owner, and the write role is not an admin or table owner. Dry runs set a 2 s
+  `lock_timeout` so repeated calls cannot queue on a hot row.
+- Residual (decisions for later): approvers see real arguments of every pending request and any
+  `decide_approval` holder can decide any request (no per-role/table approver scoping yet);
+  `dry_run` still fires triggers/sequences and is an existence oracle for a primary key, and
+  has no rate limit (Phase 5); failed-auth audit inserts are unthrottled; `success`/`error`
+  outcome records are best effort if the audit DB drops after the durable `allow` record;
+  audit rows are not hash-chained, so a DB superuser can still edit them; migration 0001
+  creates dev login roles with placeholder passwords unless `GATEWAY_MIGRATE_CREATE_ROLES=0`.
+- `approval_id` is a UUID; error text is generic ("Approval not valid") and the reason goes to
+  the audit log only. A medium tool ignores an unrelated `approval_id` (it does not consume it).
+
 ## Phase 3 authentication (resource server only)
 - Tokens: RS256/ES256 only, algorithm taken from our allow-list (never the token), signature,
   `iss`, exact `aud`, `exp`, `iat`, `sub` required, `nbf` enforced, 30 s skew, 8 KB cap, `kid`

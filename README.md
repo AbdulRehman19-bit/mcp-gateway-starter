@@ -28,6 +28,25 @@ Set `TARGET_DB_RO_URL` (see `.env.example`), run `docker compose up -d db`, then
 command above. If your DB volume predates Phase 2, run
 `docker compose down -v && docker compose up -d db` so `gateway_ro` gets `SELECT (phone)`.
 
+### Writes, approvals and audit (Phase 4)
+Writes are off by default. To try the approval flow:
+```bash
+GATEWAY_DB_ADMIN_URL=postgresql+asyncpg://postgres:postgres-dev-only@localhost:5432/gateway \
+  uv run alembic upgrade head                    # creates audit_log + approvals, app roles
+# existing DB volume? also: docker exec <db> psql -U postgres -d demo -c "GRANT DELETE ON orders TO gateway_rw"
+# in .env: GATEWAY_READ_ONLY=false, TARGET_DB_RW_URL, GATEWAY_DB_URL, GATEWAY_AUDIT_DB_URL
+uv run mcp-gateway --transport http
+```
+1. bob (`db:write`, operator) calls `update_record` (medium risk: runs directly) or
+   `delete_record` (high risk: returns `pending_approval` + `approval_id`, nothing is deleted).
+2. carol (`approvals:decide`, approver) calls `list_approvals`, reviews the real arguments, then
+   `decide_approval` with `approve`/`deny`. Nobody can decide their own request.
+3. bob repeats the SAME `delete_record` call with `approval_id`: it executes exactly once.
+   A changed argument, another user, an expired or used approval is refused.
+
+`dry_run: true` on a write rolls it back and returns only the affected row count. Every step is
+written to the JSON log and to `audit_log` (who, tool, redacted args, risk, decision, duration).
+
 ### HTTP + OAuth (Keycloak)
 ```bash
 docker compose --profile auth up -d keycloak     # imports docker/keycloak/realm-mcp-gateway.json
