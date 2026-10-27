@@ -1,6 +1,6 @@
 """Structured JSON audit logging with argument redaction (rule 8).
 
-Phase 1: logs only. The audit_log table arrives in Phase 4.
+Every record goes to the JSON log (stderr); `sink.Auditor` also writes it to the audit_log table.
 """
 
 import hashlib
@@ -39,6 +39,12 @@ def redact_args(args: dict[str, Any]) -> dict[str, Any]:
                 "sha256": hashlib.sha256(value.encode()).hexdigest()[:16],
                 "length": len(value),
             }
+        elif key == "changes":
+            # Column names only, never values. Anything that is not a dict (a malformed call)
+            # is fully redacted, since we cannot tell names from values.
+            out[key] = (
+                {str(c): "[redacted]" for c in value} if isinstance(value, dict) else "[redacted]"
+            )
         elif isinstance(value, str) and len(value) > 128:
             out[key] = value[:128] + "...[truncated]"
         else:
@@ -56,18 +62,22 @@ def audit(
     reason: str = "",
     role: str = "",
     subject: str = "",
-) -> None:
-    structlog.get_logger("audit").info(
-        "tool_call",
-        request_id=request_id,
-        subject=subject,
-        role=role,
-        tool=tool,
-        decision=decision,
-        args=redact_args(args),
-        reason=reason,
-        duration_ms=round((time.monotonic() - started) * 1000, 2),
-    )
+    risk: str = "",
+) -> dict[str, Any]:
+    """Log one audit event as JSON and return exactly what was logged (for the DB sink)."""
+    record: dict[str, Any] = {
+        "request_id": request_id,
+        "subject": subject,
+        "role": role,
+        "tool": tool,
+        "risk": risk,
+        "decision": decision,
+        "args": redact_args(args),
+        "reason": reason[:500],
+        "duration_ms": round((time.monotonic() - started) * 1000, 2),
+    }
+    structlog.get_logger("audit").info("tool_call", **record)
+    return record
 
 
 def new_request_id() -> str:

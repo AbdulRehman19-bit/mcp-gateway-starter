@@ -14,6 +14,9 @@ RiskTier = Literal["low", "medium", "high"]
 # Tools for the approval workflow itself; they are gated by role, not by risk tier.
 APPROVER_TOOLS = frozenset({"list_approvals", "decide_approval"})
 
+# Never lowered by policy: deleting or bulk-changing data always needs a human.
+DESTRUCTIVE_TOOLS = frozenset({"delete_record", "bulk_update"})
+
 
 class _Strict(BaseModel):
     # Unknown keys are errors: a typo in a policy file must not silently widen access.
@@ -31,6 +34,8 @@ class TableRule(_Strict):
     deny_columns: list[str] = Field(default_factory=list)
     mask_columns: list[str] = Field(default_factory=list)
     writable_columns: list[str] = Field(default_factory=list)
+    # delete_record may only target tables that opt in; default is no.
+    deletable: bool = False
 
 
 class SchemaRule(_Strict):
@@ -50,18 +55,20 @@ class RiskTiers(_Strict):
     high: list[str] = Field(default_factory=list)
 
     def tier_of(self, tool: str) -> RiskTier | None:
-        if tool in self.low:
-            return "low"
-        if tool in self.medium:
-            return "medium"
+        # Highest tier wins, so even an unvalidated overlap can never lower a tool's risk.
         if tool in self.high:
             return "high"
+        if tool in self.medium:
+            return "medium"
+        if tool in self.low:
+            return "low"
         return None
 
 
 class Approvals(_Strict):
     ttl_minutes: int = Field(default=30, ge=1, le=1_440)
-    require_different_approver: bool = True
+    # Rule 7 is not configurable: the requester can never approve their own request.
+    require_different_approver: Literal[True] = True
 
 
 class Policy(_Strict):
@@ -74,6 +81,14 @@ class Policy(_Strict):
 
     @model_validator(mode="after")
     def _check_references(self) -> "Policy":
+        tiers = (self.risk.low, self.risk.medium, self.risk.high)
+        listed = [t for tier in tiers for t in tier]
+        dupes = sorted({t for t in listed if listed.count(t) > 1})
+        if dupes:
+            raise ValueError(f"tools listed in more than one risk tier: {dupes}")
+        weak = sorted(t for t in DESTRUCTIVE_TOOLS if t in listed and t not in self.risk.high)
+        if weak:
+            raise ValueError(f"destructive tools must be in the high tier: {weak}")
         for role_name, role in self.roles.items():
             # Approver tools are registered separately; every other tool needs a risk tier.
             unknown = [
@@ -81,6 +96,11 @@ class Policy(_Strict):
             ]
             if unknown:
                 raise ValueError(f"role '{role_name}' uses tools with no risk tier: {unknown}")
+            stray = [t for t in role.approval_required if t not in role.tools]
+            if stray:
+                raise ValueError(
+                    f"role '{role_name}' approval_required lists unknown tools: {stray}"
+                )
         for scope, role_name in self.scope_to_role.items():
             if role_name not in self.roles:
                 raise ValueError(f"scope '{scope}' maps to unknown role '{role_name}'")

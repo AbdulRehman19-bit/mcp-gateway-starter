@@ -17,3 +17,11 @@ def test_substring_keys_and_long_values() -> None:
     assert out["db_password"] == "[redacted]"
     assert out["api_token"] == "[redacted]"
     assert len(out["table"]) < 200
+
+
+def test_non_dict_changes_are_fully_redacted() -> None:
+    for bad in (["secretvalue"], "secretvalue", 42, ("a",)):
+        assert redact_args({"changes": bad})["changes"] == "[redacted]"
+    assert redact_args({"changes": {"status": "secretvalue"}})["changes"] == {
+        "status": "[redacted]"
+    }

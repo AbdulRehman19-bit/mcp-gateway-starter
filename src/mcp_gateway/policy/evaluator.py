@@ -36,6 +36,21 @@ def effective_read_only(policy: Policy, role: str, global_read_only: bool) -> bo
     return global_read_only or rp is None or rp.read_only
 
 
+def writable_columns(policy: Policy, role: str, schema: str, table: str) -> frozenset[str]:
+    """Columns update_record may touch: only what the policy lists, never a denied column."""
+    rp = get_role(policy, role)
+    rule = rp.schemas[schema].tables.get(table) if rp and schema in rp.schemas else None
+    if rule is None:
+        return frozenset()
+    return frozenset(rule.writable_columns) - frozenset(rule.deny_columns)
+
+
+def is_deletable(policy: Policy, role: str, schema: str, table: str) -> bool:
+    rp = get_role(policy, role)
+    rule = rp.schemas[schema].tables.get(table) if rp and schema in rp.schemas else None
+    return rule is not None and rule.deletable
+
+
 def allowed_tables(policy: Policy, role: str, catalog: Catalog) -> AllowedTables:
     """Resolve the role's table/column rules against the catalog.
 

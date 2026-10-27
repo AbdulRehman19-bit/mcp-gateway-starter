@@ -41,14 +41,15 @@ roles:
 
   operator:
     read_only: false
-    tools: [list_tables, describe_table, run_query, update_record]
-    approval_required: []        # medium-risk writes are allowed directly
+    tools: [list_tables, describe_table, run_query, update_record, delete_record]
+    approval_required: []        # medium-risk writes are allowed directly; high always needs approval
     schemas:
       public:
         tables:
           orders:
             columns: ["*"]
             writable_columns: [status, notes]   # update_record may only touch these
+            deletable: true                     # delete_record allowed here (needs approval)
           customers:
             columns: [id, name, country, created_at]
 
