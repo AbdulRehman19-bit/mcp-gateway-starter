@@ -7,6 +7,24 @@
   "registrationAllowed": false,
   "clientScopes": [
     {
+      "name": "basic",
+      "description": "Keycloak 26 keeps the `sub` claim in this scope; defining our own clientScopes means the built-in one is not created, so we declare it.",
+      "protocol": "openid-connect",
+      "attributes": { "include.in.token.scope": "false", "display.on.consent.screen": "false" },
+      "protocolMappers": [
+        {
+          "name": "sub",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-sub-mapper",
+          "consentRequired": false,
+          "config": {
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
       "name": "db:read",
       "protocol": "openid-connect",
       "attributes": { "include.in.token.scope": "true", "display.on.consent.screen": "false" }

@@ -121,7 +121,8 @@ def test_no_token_is_401(server: Path) -> None:
     assert "www-authenticate" in resp.headers
 
 
-@pytest.mark.parametrize("bad", ["", "garbage", "a.b.c", "x" * 9000])
+# An empty bearer cannot be sent (illegal header value); unit tests cover empty tokens.
+@pytest.mark.parametrize("bad", ["garbage", "a.b.c", "x" * 9000])
 def test_garbage_tokens_are_401(server: Path, bad: str) -> None:
     assert raw_init(bad).status_code == 401
 
