@@ -15,6 +15,9 @@ RUN uv sync --no-dev --no-install-project
 
 COPY src ./src
 COPY policies ./policies
+# Alembic is run from this same image (docker compose `migrate` service)
+COPY alembic.ini ./
+COPY migrations ./migrations
 RUN uv sync --no-dev
 
 # Run as a non-root user

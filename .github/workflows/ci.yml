@@ -11,16 +11,6 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: demo
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s --health-timeout 3s --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -29,3 +19,29 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy src
       - run: uv run pytest -q
+      - run: docker compose config -q
+
+  audit:
+    # Known-vulnerable dependencies fail the build (dev-only tool: pip-audit).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - run: uv run pip-audit
+
+  integration:
+    # Real Postgres with the demo roles and the Alembic schema. Keycloak-based end-to-end tests
+    # skip themselves here (slow); run them locally with `docker compose up`.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - run: docker compose up -d --wait db
+      - run: uv run alembic upgrade head
+        env:
+          GATEWAY_DB_ADMIN_URL: postgresql+asyncpg://postgres:postgres-dev-only@localhost:5432/gateway
+      - run: uv run pytest -m integration -q -rs
+      - if: failure()
+        run: docker compose logs db

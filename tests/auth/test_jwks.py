@@ -157,3 +157,34 @@ async def test_redirects_are_not_followed() -> None:
     client = httpx.AsyncClient(transport=httpx.MockTransport(redirect), follow_redirects=False)
     src = JwksKeySource(URL, client=client, clock=Clock())
     assert await src.get_key("k1") is None
+
+
+def test_plain_http_hostname_needs_an_explicit_opt_in() -> None:
+    url = "http://keycloak:8080/realms/gw/protocol/openid-connect/certs"
+    with pytest.raises(ValueError):
+        validate_jwks_url(url)  # default: loopback or https only
+    assert validate_jwks_url(url, http_hosts=frozenset({"keycloak"})) == url
+    with pytest.raises(ValueError):  # only the exact name listed, not lookalikes
+        validate_jwks_url("http://keycloak.evil.com/certs", http_hosts=frozenset({"keycloak"}))
+    with pytest.raises(ValueError):
+        validate_jwks_url("http://evil/certs", http_hosts=frozenset({"keycloak"}))
+
+
+def test_opt_in_does_not_relax_the_other_rules() -> None:
+    allow = frozenset({"keycloak"})
+    for bad in (
+        "http://user:pw@keycloak/certs",
+        "http://keycloak@evil.com/certs",
+        "https://169.254.169.254/certs",
+        "ftp://keycloak/certs",
+    ):
+        with pytest.raises(ValueError):
+            validate_jwks_url(bad, http_hosts=allow)
+
+
+def test_settings_parse_the_allowed_host_list() -> None:
+    from mcp_gateway.config import Settings
+
+    s = Settings(_env_file=None, oauth_jwks_http_allowed_hosts=" Keycloak, idp.internal ,,")  # type: ignore[call-arg]
+    assert s.jwks_http_hosts() == frozenset({"keycloak", "idp.internal"})
+    assert Settings(_env_file=None).jwks_http_hosts() == frozenset()  # type: ignore[call-arg]

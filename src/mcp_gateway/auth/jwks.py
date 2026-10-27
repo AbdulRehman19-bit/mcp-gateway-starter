@@ -26,13 +26,18 @@ _FETCH_DEADLINE_SECONDS = 10
 _log = structlog.get_logger("jwks")
 
 
-def validate_jwks_url(url: str) -> str:
-    """https, or http on loopback. No credentials in the URL, no private/link-local IP literals."""
+def validate_jwks_url(url: str, *, http_hosts: frozenset[str] = frozenset()) -> str:
+    """https, or http on loopback. No credentials in the URL, no private/link-local IP literals.
+
+    `http_hosts` is an explicit operator opt-in for plain-http hostnames that are only reachable
+    on a private network (the `keycloak` service in docker compose). It is empty by default and
+    never applies to anything but the exact names listed.
+    """
     parsed = urlparse(url)
     host = parsed.hostname
     if not host or parsed.username or parsed.password:
         raise ValueError("URL must have a host and no credentials")
-    if parsed.scheme == "http" and host in _LOOPBACK:
+    if parsed.scheme == "http" and (host in _LOOPBACK or host in http_hosts):
         return url
     if parsed.scheme != "https":
         raise ValueError("URL must be https (http allowed only on loopback)")
@@ -56,8 +61,9 @@ class JwksKeySource:
         ttl_seconds: int = 300,
         min_refresh_seconds: int = 60,
         clock: Any = time.monotonic,
+        http_hosts: frozenset[str] = frozenset(),
     ) -> None:
-        self._url = validate_jwks_url(url)
+        self._url = validate_jwks_url(url, http_hosts=http_hosts)
         self._client = client or httpx.AsyncClient(timeout=5.0, follow_redirects=False)
         self._ttl = ttl_seconds
         self._min_refresh = min_refresh_seconds

@@ -1,3 +1,17 @@
+# One command for the whole demo stack:  docker compose up --build
+#   db        Postgres 16 with demo data and the RO/RW roles
+#   keycloak  dev identity provider (imports docker/keycloak/realm-mcp-gateway.json)
+#   migrate   one-shot: alembic upgrade head (audit_log + approvals in the gateway DB)
+#   gateway   the MCP gateway on http://127.0.0.1:8000/mcp
+#
+# DEV ONLY: every credential below is a well-known placeholder, writes are enabled so the
+# approval demo works, and the realm uses the password grant. Ports are published on loopback
+# only. For anything real, start from .env.example (read-only by default) and real secrets.
+
+x-gateway-image: &gateway-image
+  image: mcp-gateway:dev
+  build: .
+
 services:
   db:
     image: postgres:16
@@ -6,7 +20,7 @@ services:
       POSTGRES_PASSWORD: postgres-dev-only
       POSTGRES_DB: demo
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./docker/initdb:/docker-entrypoint-initdb.d:ro
@@ -16,30 +30,55 @@ services:
       timeout: 3s
       retries: 10
 
-  gateway:
-    build: .
-    profiles: ["app"]
-    env_file: .env
-    environment:
-      GATEWAY_TRANSPORT: http
-    ports:
-      - "8000:8000"
-    depends_on:
-      db:
-        condition: service_healthy
-
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
-    profiles: ["auth"]
     command: start-dev --import-realm
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: admin-dev-only
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       # Dev-only realm: users alice/bob/carol, password grant enabled. Never use in production.
       - ./docker/keycloak:/opt/keycloak/data/import:ro
+
+  migrate:
+    <<: *gateway-image
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      GATEWAY_DB_ADMIN_URL: postgresql+asyncpg://postgres:postgres-dev-only@db:5432/gateway
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  gateway:
+    <<: *gateway-image
+    environment:
+      GATEWAY_TRANSPORT: http
+      GATEWAY_READ_ONLY: "false"          # demo: lets update_record / delete_record run
+      TARGET_DB_RO_URL: postgresql+asyncpg://gateway_ro:change-me-ro@db:5432/demo
+      TARGET_DB_RW_URL: postgresql+asyncpg://gateway_rw:change-me-rw@db:5432/demo
+      GATEWAY_DB_URL: postgresql+asyncpg://gateway_app:change-me-app@db:5432/gateway
+      GATEWAY_AUDIT_DB_URL: postgresql+asyncpg://gateway_audit:change-me-audit@db:5432/gateway
+      # Tokens are issued to clients that reach Keycloak as localhost:8080, so `iss` is that URL;
+      # the gateway fetches the signing keys over the private network as keycloak:8080.
+      OAUTH_ISSUER: http://localhost:8080/realms/mcp-gateway
+      OAUTH_JWKS_URL: http://keycloak:8080/realms/mcp-gateway/protocol/openid-connect/certs
+      OAUTH_JWKS_HTTP_ALLOWED_HOSTS: keycloak
+      GATEWAY_PUBLIC_URL: http://127.0.0.1:8000/mcp
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), 3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
 volumes:
   pgdata:
