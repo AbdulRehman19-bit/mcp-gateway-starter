@@ -22,6 +22,7 @@ from mcp_gateway.approvals.store import ApprovalLimitError, ApprovalStore, Appro
 from mcp_gateway.audit.logging import new_request_id
 from mcp_gateway.audit.sink import Auditor, AuditUnavailable
 from mcp_gateway.auth.roles import Identity
+from mcp_gateway.connectors.github import GithubConnector
 from mcp_gateway.connectors.postgres import ConnectorError, PostgresReadConnector
 from mcp_gateway.connectors.postgres_write import SUPPORTED_TYPES, PostgresWriteConnector
 from mcp_gateway.policy import Policy
@@ -33,6 +34,7 @@ from mcp_gateway.policy.evaluator import (
     writable_columns,
 )
 from mcp_gateway.policy.models import APPROVER_TOOLS
+from mcp_gateway.ratelimit import Limit, RateLimiter
 from mcp_gateway.risk import classify, needs_approval
 from mcp_gateway.sqlguard import GuardError
 from mcp_gateway.sqlguard.analyze import rewrite_for_policy
@@ -40,6 +42,9 @@ from mcp_gateway.tools.schemas import (
     DecideApprovalInput,
     DeleteRecordInput,
     DescribeTableInput,
+    GithubAddCommentInput,
+    GithubGetIssueInput,
+    GithubListIssuesInput,
     ListApprovalsInput,
     ListTablesInput,
     RunQueryInput,
@@ -49,6 +54,7 @@ from mcp_gateway.tools.schemas import (
 IdentitySource = Callable[[], Identity | None]
 _INTEGER_TYPES = frozenset({"integer", "bigint", "smallint"})
 _AUDIT_DOWN = "Audit unavailable; request refused."
+PAGE_SIZE = 50
 
 
 class ToolFailure(Exception):
@@ -68,16 +74,23 @@ class ToolService:
         writer: PostgresWriteConnector | None = None,
         approvals: ApprovalStore | None = None,
         primary_keys: dict[tuple[str, str], str] | None = None,
+        limiter: RateLimiter | None = None,
+        github: GithubConnector | None = None,
     ) -> None:
         self._connector = connector
         self._policy = policy
         self._allowed_by_role = allowed_by_role
         self._identity_source = identity_source
-        self._auditor = auditor or Auditor()
+        self._auditor = Auditor() if auditor is None else auditor
         self._global_ro = global_read_only
         self._writer = writer
         self._approvals = approvals
         self._pks = primary_keys or {}
+        # `is None`, not `or`: an empty RateLimiter is falsy (it has __len__)
+        self._limiter = RateLimiter() if limiter is None else limiter
+        self._github = github
+        gh_policy = policy.connectors.github
+        self._github_repos = frozenset(gh_policy.repos) if gh_policy else frozenset()
 
     # ---- plumbing -------------------------------------------------------------------------
 
@@ -114,6 +127,20 @@ class ToolService:
         except AuditUnavailable as exc:
             raise ToolFailure(_AUDIT_DOWN) from exc
 
+    async def _rate_limit(
+        self, tool: str, rid: str, args: dict[str, Any], started: float, ident: Identity
+    ) -> None:
+        """One bucket per (subject, tool); limits come from the policy. Runs right after
+        identity so a flood is cut off before any policy, DB or upstream work."""
+        rl = self._policy.limits.tools.get(tool, self._policy.limits.default)
+        decision = self._limiter.check(
+            (ident.subject, tool), Limit(per_minute=rl.per_minute, burst=rl.burst)
+        )
+        if not decision.allowed:
+            reason = f"rate_limited retry_after={decision.retry_after:.1f}s"
+            await self._audit(rid, tool, "deny", args, started, ident, reason)
+            raise ToolFailure(f"Rate limit exceeded. Retry in {decision.retry_after_seconds} s.")
+
     async def _authorize(
         self, tool: str, rid: str, args: dict[str, Any], started: float
     ) -> tuple[Identity, AllowedTables]:
@@ -121,6 +148,7 @@ class ToolService:
         if ident is None:
             await self._audit(rid, tool, "deny", args, started, None, "no identity")
             raise ToolFailure("Not permitted.")
+        await self._rate_limit(tool, rid, args, started, ident)
         if not tool_allowed(self._policy, ident.role, tool):
             await self._audit(rid, tool, "deny", args, started, ident, "tool not allowed for role")
             raise ToolFailure("Not permitted.")
@@ -150,6 +178,7 @@ class ToolService:
         if ident is None:
             await self._audit(rid, "ping", "deny", {}, started, None, "no identity")
             raise ToolFailure("Not permitted.")
+        await self._rate_limit("ping", rid, {}, started, ident)
         await self._audit(rid, "ping", "allow", {}, started, ident)
         return message
 
@@ -396,22 +425,147 @@ class ToolService:
             raise ToolFailure("Approval service unavailable.") from exc
         raise await deny(f"approval refused: {why}", "Approval not valid.")
 
+    # ---- GitHub connector -----------------------------------------------------------------
+
+    async def _github_gate(
+        self, tool: str, rid: str, started: float, ident: Identity, raw: dict[str, Any], repo: str
+    ) -> GithubConnector:
+        """Connector configured and repo allow-listed, or a denial. Runs before any request."""
+        if self._github is None:
+            await self._audit(rid, tool, "deny", raw, started, ident, "github not configured")
+            raise ToolFailure("GitHub is not configured.")
+        if repo not in self._github_repos:
+            # Same answer for "unknown" and "not allowed": no probing of private repos.
+            await self._audit(rid, tool, "deny", raw, started, ident, "repo not allow-listed")
+            raise ToolFailure("Unknown repository.")
+        return self._github
+
+    async def _github_read(
+        self, tool: str, rid: str, started: float, ident: Identity, raw: dict[str, Any], call: Any
+    ) -> dict[str, Any]:
+        try:
+            result: dict[str, Any] = await call
+        except ConnectorError as exc:
+            await self._audit(rid, tool, "error", raw, started, ident, exc.detail)
+            raise ToolFailure(exc.safe_message) from exc
+        except Exception as exc:
+            await self._audit(rid, tool, "error", raw, started, ident, type(exc).__name__)
+            raise ToolFailure("Internal error.") from exc
+        await self._audit(rid, tool, "allow", raw, started, ident)
+        return result
+
+    async def github_list_issues(
+        self, repo: str, state: str = "open", limit: int = 20
+    ) -> dict[str, Any]:
+        tool = "github_list_issues"
+        rid, started = new_request_id(), time.monotonic()
+        raw = {"repo": repo, "state": state, "limit": limit}
+        ident, _ = await self._authorize(tool, rid, raw, started)
+        inp = await self._parse(GithubListIssuesInput, tool, raw, rid, started, ident)
+        gh = await self._github_gate(tool, rid, started, ident, raw, inp.repo)
+        call = gh.list_issues(inp.repo, inp.state, inp.limit)
+        return await self._github_read(tool, rid, started, ident, raw, call)
+
+    async def github_get_issue(self, repo: str, number: int) -> dict[str, Any]:
+        tool = "github_get_issue"
+        rid, started = new_request_id(), time.monotonic()
+        raw = {"repo": repo, "number": number}
+        ident, _ = await self._authorize(tool, rid, raw, started)
+        inp = await self._parse(GithubGetIssueInput, tool, raw, rid, started, ident)
+        gh = await self._github_gate(tool, rid, started, ident, raw, inp.repo)
+        return await self._github_read(
+            tool, rid, started, ident, raw, gh.get_issue(inp.repo, inp.number)
+        )
+
+    async def github_add_comment(
+        self,
+        repo: str,
+        number: int,
+        body: str,
+        dry_run: bool = False,
+        approval_id: str | None = None,
+    ) -> dict[str, Any]:
+        tool = "github_add_comment"
+        rid, started = new_request_id(), time.monotonic()
+        raw = {
+            "repo": repo,
+            "number": number,
+            "body": body,
+            "dry_run": dry_run,
+            "approval_id": approval_id,
+        }
+        ident, _ = await self._authorize(tool, rid, raw, started)
+        inp = await self._parse(GithubAddCommentInput, tool, raw, rid, started, ident)
+
+        async def deny(reason: str, message: str = "Not permitted.") -> ToolFailure:
+            await self._audit(rid, tool, "deny", raw, started, ident, reason)
+            return ToolFailure(message)
+
+        if effective_read_only(self._policy, ident.role, self._global_ro):
+            raise await deny("read-only mode", "Writes are disabled.")
+        gh = await self._github_gate(tool, rid, started, ident, raw, inp.repo)
+        if not gh.can_write:
+            raise await deny("no github write token", "GitHub writes are not configured.")
+
+        if inp.dry_run:  # nothing leaves the gateway: report what would be posted
+            await self._audit(rid, tool, "allow", raw, started, ident, "dry_run", critical=True)
+            await self._audit(rid, tool, "success", raw, started, ident, "dry_run")
+            return {"status": "dry_run", "would_post_chars": len(inp.body)}
+
+        bound = {"repo": inp.repo, "number": inp.number, "body": inp.body}
+        audited = False
+        reason = ""
+        if needs_approval(self._policy, ident.role, tool):  # always: github_add_comment is high
+            if inp.approval_id is not None:
+                presented = f"approval {inp.approval_id} presented"
+                await self._audit(rid, tool, "allow", raw, started, ident, presented, critical=True)
+                audited = True
+            approved, pending = await self._approval_gate(
+                tool, rid, started, ident, raw, bound, inp.approval_id, deny
+            )
+            if pending is not None:
+                return pending
+            reason = f"approval {approved}"
+        if not audited:
+            await self._audit(rid, tool, "allow", raw, started, ident, reason, critical=True)
+        try:
+            posted = await gh.add_comment(inp.repo, inp.number, inp.body)
+        except ConnectorError as exc:
+            await self._audit(rid, tool, "error", raw, started, ident, exc.detail)
+            raise ToolFailure(exc.safe_message) from exc
+        except Exception as exc:
+            await self._audit(rid, tool, "error", raw, started, ident, type(exc).__name__)
+            raise ToolFailure("Internal error.") from exc
+        await self._audit(rid, tool, "success", raw, started, ident, reason)
+        return {"status": "ok", **posted}
+
     # ---- approver tools -------------------------------------------------------------------
 
-    async def list_approvals(self) -> dict[str, Any]:
+    def _approver_scope(self, ident: Identity) -> list[str]:
+        """Roles whose requests this approver may see and decide. Empty = none (fail closed)."""
+        rp = self._policy.roles.get(ident.role)
+        return list(rp.approves_roles) if rp else []
+
+    async def list_approvals(self, offset: int = 0) -> dict[str, Any]:
         rid, started = new_request_id(), time.monotonic()
-        ident, _ = await self._authorize("list_approvals", rid, {}, started)
-        await self._parse(ListApprovalsInput, "list_approvals", {}, rid, started, ident)
+        raw = {"offset": offset}
+        ident, _ = await self._authorize("list_approvals", rid, raw, started)
+        inp = await self._parse(ListApprovalsInput, "list_approvals", raw, rid, started, ident)
         if self._approvals is None:
-            await self._audit(rid, "list_approvals", "error", {}, started, ident, "not configured")
+            await self._audit(rid, "list_approvals", "error", raw, started, ident, "not configured")
             raise ToolFailure("Approvals are not configured.")
         try:
-            rows = await self._approvals.list_pending()
+            scope = self._approver_scope(ident)
+            rows = await self._approvals.list_pending(scope, PAGE_SIZE, inp.offset)
+            total = await self._approvals.count_pending(scope)
         except ApprovalStoreError as exc:
-            await self._audit(rid, "list_approvals", "error", {}, started, ident, str(exc))
+            await self._audit(rid, "list_approvals", "error", raw, started, ident, str(exc))
             raise ToolFailure("Approval service unavailable.") from exc
-        await self._audit(rid, "list_approvals", "allow", {}, started, ident)
+        await self._audit(rid, "list_approvals", "allow", raw, started, ident)
+        next_offset = inp.offset + len(rows)
         return {
+            "total_pending": total,
+            "next_offset": next_offset if next_offset < total else None,
             "approvals": [
                 {
                     "approval_id": r.id,
@@ -424,7 +578,7 @@ class ToolService:
                     "own_request": r.requester == ident.subject,
                 }
                 for r in rows
-            ]
+            ],
         }
 
     async def decide_approval(
@@ -445,12 +599,17 @@ class ToolService:
             critical=True,
         )  # fmt: skip
         try:
+            scope = self._approver_scope(ident)
             row = await self._approvals.decide(
-                inp.approval_id, approver=ident.subject, approve=approve, reason=inp.reason
+                inp.approval_id,
+                approver=ident.subject,
+                approve=approve,
+                reason=inp.reason,
+                roles=scope,
             )
             if row is None:
                 current = await self._approvals.get(inp.approval_id)
-                why = why_not_decidable(current, ident.subject, datetime.now(UTC))
+                why = why_not_decidable(current, ident.subject, datetime.now(UTC), scope)
         except ApprovalStoreError as exc:
             await self._audit(rid, "decide_approval", "error", raw, started, ident, str(exc))
             raise ToolFailure("Approval service unavailable.") from exc

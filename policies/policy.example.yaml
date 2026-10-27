@@ -9,13 +9,34 @@ defaults:
 
 # Which tools exist and how risky they are.
 risk:
-  low: [list_tables, describe_table, run_query]
+  low: [list_tables, describe_table, run_query, github_list_issues, github_get_issue]
   medium: [update_record]            # bounded write: single row, by primary key
-  high: [delete_record, bulk_update] # always needs human approval
+  high: [delete_record, bulk_update, github_add_comment]  # always needs human approval
+
+# Second connector: GitHub, read-mostly. Only these repositories can ever be reached; the
+# comment tool is high risk (it can publish data outside the gateway), so a different human
+# must approve each one. Set GITHUB_TOKEN (fine-grained PAT, Issues access on these repos only).
+connectors:
+  github:
+    repos: ["octocat/Hello-World"]
+    max_text_chars: 4000             # issue/comment text returned to the client is cut here
 
 approvals:
   ttl_minutes: 30
   require_different_approver: true
+
+# Per-user, per-tool rate limits (token buckets, in-memory). Over the limit the call is denied
+# and audited as rate_limited. Anything not listed uses `default`.
+limits:
+  default: {per_minute: 120, burst: 30}
+  tools:
+    run_query: {per_minute: 60, burst: 20}
+    update_record: {per_minute: 20, burst: 5}
+    delete_record: {per_minute: 10, burst: 10}     # also covers dry_run and approval retries
+    decide_approval: {per_minute: 30, burst: 10}
+    github_list_issues: {per_minute: 30, burst: 10}
+    github_get_issue: {per_minute: 60, burst: 20}
+    github_add_comment: {per_minute: 5, burst: 5}
 
 # OAuth scope -> role. The role is derived from the validated token, never from tool args.
 scope_to_role:
@@ -26,7 +47,7 @@ scope_to_role:
 roles:
   analyst:
     read_only: true
-    tools: [list_tables, describe_table, run_query]
+    tools: [list_tables, describe_table, run_query, github_list_issues, github_get_issue]
     schemas:
       public:
         tables:
@@ -41,7 +62,8 @@ roles:
 
   operator:
     read_only: false
-    tools: [list_tables, describe_table, run_query, update_record, delete_record]
+    tools: [list_tables, describe_table, run_query, update_record, delete_record,
+            github_list_issues, github_get_issue, github_add_comment]
     approval_required: []        # medium-risk writes are allowed directly; high always needs approval
     schemas:
       public:
@@ -56,4 +78,5 @@ roles:
   approver:
     read_only: true
     tools: [list_approvals, decide_approval]
+    approves_roles: [operator]       # may list and decide requests made by operators only
     schemas: {}

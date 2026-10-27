@@ -46,12 +46,19 @@ def test_hash_is_hex_sha256() -> None:
 
 def test_decide_refusal_reasons() -> None:
     pending = row(status="pending")
-    assert why_not_decidable(None, "carol", NOW) == "approval not found"
-    assert why_not_decidable(pending, "bob", NOW) == "requester cannot decide own request"
-    assert why_not_decidable(row(status="approved"), "carol", NOW) == "already approved"
-    assert why_not_decidable(row(status="used"), "carol", NOW) == "already used"
+    scope = ["operator"]
+    assert why_not_decidable(None, "carol", NOW, scope) == "approval not found"
+    assert why_not_decidable(pending, "bob", NOW, scope) == "requester cannot decide own request"
+    assert why_not_decidable(row(status="approved"), "carol", NOW, scope) == "already approved"
+    assert why_not_decidable(row(status="used"), "carol", NOW, scope) == "already used"
     late = row(status="pending", expires_at=NOW - timedelta(seconds=1))
-    assert why_not_decidable(late, "carol", NOW) == "expired"
+    assert why_not_decidable(late, "carol", NOW, scope) == "expired"
+
+
+def test_decide_refuses_requests_outside_the_approvers_scope() -> None:
+    pending = row(status="pending")  # requester_role is "operator"
+    assert "outside approver scope" in why_not_decidable(pending, "carol", NOW, ["analyst"])
+    assert "outside approver scope" in why_not_decidable(pending, "carol", NOW)  # no scope: none
 
 
 def test_consume_refusal_reasons() -> None:

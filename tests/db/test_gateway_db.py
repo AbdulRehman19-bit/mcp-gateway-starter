@@ -30,6 +30,7 @@ AUDIT = os.environ.get(
     "GATEWAY_AUDIT_DB_URL",
     "postgresql+asyncpg://gateway_audit:change-me-audit@localhost:5432/gateway",
 )
+OPS = ["operator"]  # the approver scope used by these tests
 ARGS: dict[str, Any] = {"schema_name": "public", "table": "orders", "pk": 3}
 H = args_hash("delete_record", ARGS)
 
@@ -173,19 +174,24 @@ async def test_create_is_idempotent_for_identical_live_requests(store: ApprovalS
 
 async def test_decide_refuses_self_and_allows_a_different_user(store: ApprovalStore) -> None:
     row = await make(store)
-    assert await store.decide(row.id, approver=row.requester, approve=True, reason=None) is None
+    assert (
+        await store.decide(row.id, approver=row.requester, approve=True, reason=None, roles=OPS)
+        is None
+    )
     assert (await store.get(row.id)).status == "pending"  # type: ignore[union-attr]
-    done = await store.decide(row.id, approver="carol", approve=True, reason="ok")
+    done = await store.decide(row.id, approver="carol", approve=True, reason="ok", roles=OPS)
     assert done is not None
     assert (done.status, done.decided_by) == ("approved", "carol")
-    assert await store.decide(row.id, approver="erin", approve=False, reason=None) is None  # once
+    assert (
+        await store.decide(row.id, approver="erin", approve=False, reason=None, roles=OPS) is None
+    )  # once
 
 
 async def test_consume_exactly_once_sequentially(store: ApprovalStore) -> None:
     row = await make(store)
     kw = {"requester": row.requester, "tool": "delete_record", "args_hash": row.args_hash}
     assert not await store.consume(row.id, **kw)  # still pending
-    await store.decide(row.id, approver="carol", approve=True, reason=None)
+    await store.decide(row.id, approver="carol", approve=True, reason=None, roles=OPS)
     assert await store.consume(row.id, **kw)
     assert not await store.consume(row.id, **kw)  # replay
     assert (await store.get(row.id)).status == "used"  # type: ignore[union-attr]
@@ -193,7 +199,7 @@ async def test_consume_exactly_once_sequentially(store: ApprovalStore) -> None:
 
 async def test_concurrent_consumers_get_exactly_one_win(store: ApprovalStore) -> None:
     row = await make(store)
-    await store.decide(row.id, approver="carol", approve=True, reason=None)
+    await store.decide(row.id, approver="carol", approve=True, reason=None, roles=OPS)
     kw = {"requester": row.requester, "tool": "delete_record", "args_hash": row.args_hash}
     results = await asyncio.gather(*[store.consume(row.id, **kw) for _ in range(25)])
     assert sum(results) == 1
@@ -203,7 +209,9 @@ async def test_concurrent_decisions_get_exactly_one_win(store: ApprovalStore) ->
     row = await make(store)
     results = await asyncio.gather(
         *[
-            store.decide(row.id, approver=f"approver{i}", approve=i % 2 == 0, reason=None)
+            store.decide(
+                row.id, approver=f"approver{i}", approve=i % 2 == 0, reason=None, roles=OPS
+            )
             for i in range(20)
         ]
     )
@@ -212,7 +220,7 @@ async def test_concurrent_decisions_get_exactly_one_win(store: ApprovalStore) ->
 
 async def test_consume_is_bound_to_requester_tool_and_hash(store: ApprovalStore) -> None:
     row = await make(store)
-    await store.decide(row.id, approver="carol", approve=True, reason=None)
+    await store.decide(row.id, approver="carol", approve=True, reason=None, roles=OPS)
     good = {"requester": row.requester, "tool": "delete_record", "args_hash": row.args_hash}
     assert not await store.consume(row.id, **{**good, "requester": "mallory"})
     assert not await store.consume(row.id, **{**good, "tool": "update_record"})
@@ -224,11 +232,13 @@ async def test_consume_is_bound_to_requester_tool_and_hash(store: ApprovalStore)
 async def test_expiry_uses_the_database_clock(admin: AsyncEngine, store: ApprovalStore) -> None:
     row = await make(store)
     await age(admin, row.id)
-    assert await store.decide(row.id, approver="carol", approve=True, reason=None) is None
-    assert row.id not in [r.id for r in await store.list_pending(500)]
+    assert (
+        await store.decide(row.id, approver="carol", approve=True, reason=None, roles=OPS) is None
+    )
+    assert row.id not in [r.id for r in await store.list_pending(OPS, 500)]
 
     row2 = await make(store)
-    await store.decide(row2.id, approver="carol", approve=True, reason=None)
+    await store.decide(row2.id, approver="carol", approve=True, reason=None, roles=OPS)
     await age(admin, row2.id)
     kw = {"requester": row2.requester, "tool": "delete_record", "args_hash": row2.args_hash}
     assert not await store.consume(row2.id, **kw)
@@ -307,7 +317,7 @@ async def test_trigger_allows_only_legal_transitions_even_for_the_owner(
     ):
         with pytest.raises((DBAPIError, ProgrammingError)):
             await force(admin, sql, i=row.id)
-    await store.decide(row.id, approver="carol", approve=True, reason=None)
+    await store.decide(row.id, approver="carol", approve=True, reason=None, roles=OPS)
     kw = {"requester": row.requester, "tool": "delete_record", "args_hash": row.args_hash}
     assert await store.consume(row.id, **kw)
     for sql in (  # a spent approval can never be revived
@@ -362,11 +372,11 @@ async def test_arguments_are_dropped_once_an_approval_is_spent_or_denied(
 ) -> None:
     a = await make(store)
     assert a.args
-    await store.decide(a.id, approver="carol", approve=False, reason="no")
+    await store.decide(a.id, approver="carol", approve=False, reason="no", roles=OPS)
     assert (await store.get(a.id)).args == {}  # type: ignore[union-attr]
 
     b = await make(store)
-    await store.decide(b.id, approver="carol", approve=True, reason=None)
+    await store.decide(b.id, approver="carol", approve=True, reason=None, roles=OPS)
     assert (await store.get(b.id)).args  # type: ignore[union-attr]  # kept while approvable
     await store.consume(b.id, requester=b.requester, tool="delete_record", args_hash=b.args_hash)
     assert (await store.get(b.id)).args == {}  # type: ignore[union-attr]
@@ -378,7 +388,9 @@ async def test_cancel_withdraws_only_own_pending_approvals(store: ApprovalStore)
     assert (await store.get(row.id)).status == "pending"  # type: ignore[union-attr]
     await store.cancel(row.id, requester=row.requester)
     assert (await store.get(row.id)).status == "denied"  # type: ignore[union-attr]
-    assert await store.decide(row.id, approver="carol", approve=True, reason=None) is None
+    assert (
+        await store.decide(row.id, approver="carol", approve=True, reason=None, roles=OPS) is None
+    )
 
 
 async def test_privilege_probes_accept_the_real_roles_and_reject_wrong_ones(
@@ -399,3 +411,26 @@ async def test_privilege_probes_accept_the_real_roles_and_reject_wrong_ones(
         assert any("superuser" in p for p in approvals_role_problems(owner))
     finally:
         await sink.close()
+
+
+async def test_approver_scope_is_enforced_by_the_database(store: ApprovalStore) -> None:
+    who = f"con-{uuid.uuid4().hex[:8]}"
+    args = {**ARGS, "pk": uuid.uuid4().int % 10**9}
+    row = await store.create(
+        requester=who, requester_role="contractor", tool="delete_record",
+        args_hash=args_hash("delete_record", args), args=args, ttl_minutes=30,
+    )  # fmt: skip
+    mine = [r.id for r in await store.list_pending(["contractor"], 500)]
+    assert row.id in mine
+    assert row.id not in [r.id for r in await store.list_pending(OPS, 500)]  # other scope: hidden
+    assert row.id not in [r.id for r in await store.list_pending([], 500)]  # empty scope: nothing
+    assert await store.count_pending([]) == 0
+    assert (
+        await store.decide(row.id, approver="carol", approve=True, reason=None, roles=OPS) is None
+    )
+    assert await store.decide(row.id, approver="carol", approve=True, reason=None, roles=[]) is None
+    assert (await store.get(row.id)).status == "pending"  # type: ignore[union-attr]
+    done = await store.decide(
+        row.id, approver="dave", approve=True, reason=None, roles=["contractor"]
+    )
+    assert done is not None and done.status == "approved"

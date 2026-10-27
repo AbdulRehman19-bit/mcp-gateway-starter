@@ -10,6 +10,7 @@ the fixed column list into `{cols}`, never anything from a caller.
 """
 
 import json
+from collections.abc import Sequence
 from typing import Any
 
 from sqlalchemy import text
@@ -55,7 +56,11 @@ _CANCEL = text(
 )
 _LIST_PENDING = _q(
     "SELECT {cols} FROM approvals WHERE status = 'pending' AND expires_at > now() "
-    "ORDER BY created_at LIMIT :n"
+    "AND requester_role = ANY(:roles) ORDER BY created_at, id LIMIT :n OFFSET :o"
+)
+_COUNT_PENDING = text(
+    "SELECT count(*) FROM approvals WHERE status = 'pending' AND expires_at > now() "
+    "AND requester_role = ANY(:roles)"
 )
 _GET = _q("SELECT {cols} FROM approvals WHERE id = CAST(:id AS uuid)")
 _DECIDE = _q(
@@ -63,7 +68,8 @@ _DECIDE = _q(
     "decision_reason = :reason, "
     "args = CASE WHEN :new = 'approved' THEN args ELSE '{}'::jsonb END "
     "WHERE id = CAST(:id AS uuid) AND status = 'pending' "
-    "AND expires_at > now() AND requester <> :a RETURNING {cols}"
+    "AND expires_at > now() AND requester <> :a AND requester_role = ANY(:roles) "
+    "RETURNING {cols}"
 )
 _CONSUME = text(
     "UPDATE approvals SET status = 'used', used_at = now(), args = '{}'::jsonb "
@@ -177,11 +183,24 @@ class ApprovalStore:
     async def verify_privileges(self) -> dict[str, Any]:
         return await probe_privileges(self._engine)
 
-    async def list_pending(self, limit: int = 50) -> list[ApprovalRow]:
+    async def list_pending(
+        self, roles: Sequence[str], limit: int = 50, offset: int = 0
+    ) -> list[ApprovalRow]:
+        """Pending requests made by `roles` only: an approver sees just what it may decide."""
         try:
             async with self._engine.connect() as conn:
-                res = await conn.execute(_LIST_PENDING, {"n": limit})
+                res = await conn.execute(
+                    _LIST_PENDING, {"n": limit, "o": offset, "roles": list(roles)}
+                )
                 return [_row(m) for m in res.mappings()]
+        except SQLAlchemyError as exc:
+            raise ApprovalStoreError(type(exc).__name__) from exc
+
+    async def count_pending(self, roles: Sequence[str]) -> int:
+        try:
+            async with self._engine.connect() as conn:
+                res = await conn.execute(_COUNT_PENDING, {"roles": list(roles)})
+                return int(res.scalar_one())
         except SQLAlchemyError as exc:
             raise ApprovalStoreError(type(exc).__name__) from exc
 
@@ -194,9 +213,16 @@ class ApprovalStore:
             raise ApprovalStoreError(type(exc).__name__) from exc
 
     async def decide(
-        self, approval_id: str, *, approver: str, approve: bool, reason: str | None
+        self,
+        approval_id: str,
+        *,
+        approver: str,
+        approve: bool,
+        reason: str | None,
+        roles: Sequence[str],
     ) -> ApprovalRow | None:
-        """Approve or deny. None means refused (not pending, expired, or self-approval)."""
+        """Approve or deny. None means refused: not pending, expired, self-approval, or the
+        requester's role is outside the approver's scope (`roles`)."""
         try:
             async with self._engine.begin() as conn:
                 m = (
@@ -207,6 +233,7 @@ class ApprovalStore:
                                 "new": "approved" if approve else "denied",
                                 "a": approver,
                                 "reason": reason,
+                                "roles": list(roles),
                                 "id": approval_id,
                             },
                         )

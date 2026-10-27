@@ -7,6 +7,7 @@ refusal for the audit log, so reasons never depend on a second racy read decidin
        \\--deny--> denied              (pending/approved past expires_at are "expired")
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -29,9 +30,13 @@ class ApprovalRow:
     decision_reason: str | None = None
 
 
-def why_not_decidable(row: ApprovalRow | None, approver: str, now: datetime) -> str:
+def why_not_decidable(
+    row: ApprovalRow | None, approver: str, now: datetime, roles: Sequence[str] = ()
+) -> str:
     if row is None:
         return "approval not found"
+    if row.requester_role not in roles:
+        return "requester role outside approver scope"
     if row.requester == approver:
         return "requester cannot decide own request"
     if row.status != PENDING:

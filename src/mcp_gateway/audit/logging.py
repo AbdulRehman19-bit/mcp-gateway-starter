@@ -34,11 +34,13 @@ def redact_args(args: dict[str, Any]) -> dict[str, Any]:
     for key, value in args.items():
         if any(k in key.lower() for k in _SENSITIVE_KEYS):
             out[key] = "[redacted]"
-        elif key == "sql" and isinstance(value, str):
+        elif key in ("sql", "body") and isinstance(value, str):
             out[key] = {
                 "sha256": hashlib.sha256(value.encode()).hexdigest()[:16],
                 "length": len(value),
             }
+        elif key == "body":  # free text from the caller: never stored, even if malformed
+            out[key] = "[redacted]"
         elif key == "changes":
             # Column names only, never values. Anything that is not a dict (a malformed call)
             # is fully redacted, since we cannot tell names from values.

@@ -162,8 +162,13 @@ async def test_full_approval_flow_executes_exactly_once(server: Path, db: AsyncE
     assert (await call(alice, "list_approvals", {})).isError
 
     # a different user reviews the real arguments and approves
-    listed = body(await call(carol, "list_approvals", {}))["approvals"]
-    mine = next(a for a in listed if a["approval_id"] == aid)
+    mine = None
+    offset: int | None = 0
+    while mine is None and offset is not None:  # the queue is paged; walk it like an approver
+        page = body(await call(carol, "list_approvals", {"offset": offset}))
+        mine = next((a for a in page["approvals"] if a["approval_id"] == aid), None)
+        offset = page["next_offset"]
+    assert mine is not None
     assert mine["requester"] != "carol"
     assert mine["tool"] == "delete_record"
     assert mine["args"]["pk"] == ROW

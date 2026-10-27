@@ -15,9 +15,14 @@ from mcp_gateway.auth.roles import Identity
 from mcp_gateway.connectors.postgres import ConnectorError, QueryResult
 from mcp_gateway.policy import Policy, load_policy
 from mcp_gateway.policy.evaluator import Catalog, allowed_tables
+from mcp_gateway.policy.models import Limits, RateLimit
 from mcp_gateway.tools.handlers import ToolFailure, ToolService
 
-POLICY = load_policy(Path(__file__).parents[1] / "policies" / "policy.example.yaml")
+_EXAMPLE = load_policy(Path(__file__).parents[1] / "policies" / "policy.example.yaml")
+# These tests are about approvals, not throttling (see test_rate_limit.py), so lift the limits.
+POLICY = _EXAMPLE.model_copy(
+    update={"limits": Limits(default=RateLimit(per_minute=100_000, burst=10_000))}
+)
 CATALOG: Catalog = {
     ("public", "orders"): {
         "id": "integer",
@@ -89,19 +94,29 @@ class FakeApprovals:
         self.rows[row.id] = row
         return row
 
-    async def list_pending(self, limit: int = 50) -> list[ApprovalRow]:
+    async def list_pending(
+        self, roles: list[str], limit: int = 50, offset: int = 0
+    ) -> list[ApprovalRow]:
         now = datetime.now(UTC)
-        return [r for r in self.rows.values() if r.status == "pending" and r.expires_at > now]
+        live = [
+            r
+            for r in self.rows.values()
+            if r.status == "pending" and r.expires_at > now and r.requester_role in roles
+        ]
+        return sorted(live, key=lambda r: r.created_at)[offset : offset + limit]
+
+    async def count_pending(self, roles: list[str]) -> int:
+        return len(await self.list_pending(roles, 10**6))
 
     async def get(self, approval_id: str) -> ApprovalRow | None:
         return self.rows.get(approval_id)
 
     async def decide(self, approval_id: str, *, approver: str, approve: bool,
-                     reason: str | None) -> ApprovalRow | None:  # fmt: skip
+                     reason: str | None, roles: list[str]) -> ApprovalRow | None:  # fmt: skip
         r = self.rows.get(approval_id)
         if not r or r.status != "pending" or r.expires_at <= datetime.now(UTC):
             return None
-        if r.requester == approver:
+        if r.requester == approver or r.requester_role not in roles:
             return None
         return self._put(r, status="approved" if approve else "denied", decided_by=approver)
 
@@ -371,6 +386,9 @@ async def test_full_flow_executes_exactly_once() -> None:
 async def test_requester_cannot_approve_own_request() -> None:
     raw = POLICY.model_dump()
     raw["roles"]["operator"]["tools"] += ["list_approvals", "decide_approval"]
+    raw["roles"]["operator"]["approves_roles"] = [
+        "operator"
+    ]  # in scope, so only self-approval blocks
     w = World(policy=Policy.model_validate(raw))
     aid = await pending_for(w)
     with pytest.raises(ToolFailure, match="Cannot decide"):
@@ -586,3 +604,89 @@ async def test_primary_key_is_never_writable_even_if_policy_lists_it() -> None:
         await w.svc.update_record("orders", 3, {"id": 99})
     assert w.writer.calls == []
     assert (await w.svc.update_record("orders", 3, {"status": "x"}))["status"] == "ok"
+
+
+async def test_list_approvals_pages_through_every_pending_request() -> None:
+    from mcp_gateway.tools.handlers import PAGE_SIZE
+
+    w = World()
+    total = PAGE_SIZE + 7
+    for i in range(total):  # distinct requesters, so the per-requester cap does not apply
+        who = Identity(f"user{i}", "operator", frozenset())
+        await w.as_(who).svc.delete_record("orders", i + 1)
+    seen: list[str] = []
+    offset: int | None = 0
+    while offset is not None:
+        page = await w.as_(CAROL).svc.list_approvals(offset)
+        assert page["total_pending"] == total
+        assert len(page["approvals"]) <= PAGE_SIZE
+        seen += [a["approval_id"] for a in page["approvals"]]
+        offset = page["next_offset"]
+    assert len(seen) == total
+    assert len(set(seen)) == total  # nothing skipped, nothing repeated, nothing hidden
+
+
+@pytest.mark.parametrize("offset", [-1, 10**9, "x", 1.5])
+async def test_list_approvals_rejects_bad_offsets(offset: Any) -> None:
+    w = World()
+    with pytest.raises(ToolFailure, match="Invalid input"):
+        await w.as_(CAROL).svc.list_approvals(offset)
+
+
+# ---- approver scoping ----------------------------------------------------------
+
+
+def _two_operator_roles() -> Policy:
+    """operator and contractor both request; carol covers operators, dave covers contractors."""
+    raw = POLICY.model_dump()
+    raw["roles"]["contractor"] = {**raw["roles"]["operator"], "approves_roles": []}
+    raw["roles"]["approver2"] = {**raw["roles"]["approver"], "approves_roles": ["contractor"]}
+    raw["scope_to_role"]["approvals:decide2"] = "approver2"
+    return Policy.model_validate(raw)
+
+
+CONTRACTOR = Identity("conrad", "contractor", frozenset())
+DAVE = Identity("dave", "approver2", frozenset())
+
+
+async def test_approver_sees_and_decides_only_roles_in_scope() -> None:
+    w = World(policy=_two_operator_roles())
+    op_id = await pending_for(w)  # bob, operator
+    con = (await w.as_(CONTRACTOR).svc.delete_record("orders", 4))["approval_id"]
+
+    carol = await w.as_(CAROL).svc.list_approvals()
+    dave = await w.as_(DAVE).svc.list_approvals()
+    assert [a["approval_id"] for a in carol["approvals"]] == [op_id]
+    assert [a["approval_id"] for a in dave["approvals"]] == [con]
+    assert carol["total_pending"] == dave["total_pending"] == 1
+
+    with pytest.raises(ToolFailure, match="Cannot decide"):  # carol cannot touch the contractor's
+        await w.as_(CAROL).svc.decide_approval(con, "approve")
+    with pytest.raises(ToolFailure, match="Cannot decide"):
+        await w.as_(DAVE).svc.decide_approval(op_id, "deny")
+    assert w.approvals.rows[con].status == w.approvals.rows[op_id].status == "pending"
+    assert any("outside approver scope" in r["reason"] for r in w.sink.records)
+
+    await w.as_(DAVE).svc.decide_approval(con, "approve")
+    await w.as_(CAROL).svc.decide_approval(op_id, "approve")
+
+
+async def test_out_of_scope_requests_are_invisible_not_just_undecidable() -> None:
+    w = World(policy=_two_operator_roles())
+    await w.as_(CONTRACTOR).svc.delete_record("orders", 4)
+    out = await w.as_(CAROL).svc.list_approvals()
+    assert out["approvals"] == [] and out["total_pending"] == 0
+
+
+def test_a_decider_role_with_an_empty_scope_is_a_policy_error() -> None:
+    raw = POLICY.model_dump()
+    raw["roles"]["approver"]["approves_roles"] = []
+    with pytest.raises(ValueError, match="approves_roles is empty"):
+        Policy.model_validate(raw)
+
+
+def test_approver_scope_must_name_real_roles() -> None:
+    raw = POLICY.model_dump()
+    raw["roles"]["approver"]["approves_roles"] = ["operator", "ghost"]
+    with pytest.raises(ValueError, match="unknown roles"):
+        Policy.model_validate(raw)
