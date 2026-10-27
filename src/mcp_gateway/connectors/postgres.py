@@ -162,6 +162,21 @@ class PostgresReadConnector:
         if not res.rows or any(res.rows[0]):
             raise ConnectorError("Database role is not read-only.", "privileged role")
 
+    async def load_primary_keys(self, schemas: Iterable[str]) -> dict[tuple[str, str], str]:
+        """Single-column primary keys per table (composite keys are unsupported for writes).
+
+        Read from pg_catalog, which every role can see; information_schema hides constraints
+        on tables the role may only SELECT from.
+        """
+        res = await self._run(
+            "SELECT n.nspname, c.relname, a.attname, i.indnkeyatts FROM pg_index i "
+            "JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey) "
+            "WHERE i.indisprimary AND n.nspname = ANY(:schemas)",
+            {"schemas": sorted(set(schemas))},
+        )
+        return {(r[0], r[1]): r[2] for r in res.rows if r[3] == 1}
+
     async def run_query(self, sql: str, *, limit: int | None = None) -> QueryResult:
         return await self._run(sql, {}, limit=limit, raw=True)
 

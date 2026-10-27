@@ -39,19 +39,19 @@ def _reset_service() -> Iterator[None]:
     server._service = None
 
 
-def test_ping_with_identity_is_audited() -> None:
+async def test_ping_with_identity_is_audited() -> None:
     use_service(lambda: Identity("u1", "analyst", frozenset()))
     with structlog.testing.capture_logs() as logs:
-        assert __version__ in server.ping()
+        assert __version__ in await server.ping()
     assert (logs[0]["tool"], logs[0]["decision"], logs[0]["subject"]) == ("ping", "allow", "u1")
 
 
-def test_ping_without_identity_or_service_is_denied() -> None:
+async def test_ping_without_identity_or_service_is_denied() -> None:
     with pytest.raises(ToolFailure):  # not configured: fail closed
-        server.ping()
+        await server.ping()
     use_service(lambda: None)
     with structlog.testing.capture_logs() as logs, pytest.raises(ToolFailure):
-        server.ping()
+        await server.ping()
     assert logs[0]["decision"] == "deny"
 
 
