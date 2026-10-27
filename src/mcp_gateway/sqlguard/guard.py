@@ -52,7 +52,7 @@ def ensure_single_select(sql: str) -> None:
     if len(statements) != 1:
         raise GuardError(f"expected exactly one statement, got {len(statements)}")
     tree = statements[0]
-    if not isinstance(tree, exp.Select):
+    if not isinstance(tree, exp.Select | exp.SetOperation):
         raise GuardError(f"root is {type(tree).__name__}, not Select")
     bad = tree.find(*_FORBIDDEN)
     if bad is not None:
