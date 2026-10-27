@@ -49,3 +49,10 @@ GRANT SELECT (id, phone, created_at) ON users TO gateway_ro;
 -- Read-write role: limited UPDATE on specific columns only.
 GRANT SELECT ON orders, customers TO gateway_rw;
 GRANT UPDATE (status, notes) ON orders TO gateway_rw;
+-- delete_record (high risk, needs human approval in the gateway). Table-level, on orders only.
+GRANT DELETE ON orders TO gateway_rw;
+
+-- The gateway's own DB (audit_log, approvals) is created by Alembic, not here:
+--   GATEWAY_DB_ADMIN_URL=postgresql+asyncpg://postgres:postgres-dev-only@localhost:5432/gateway \
+--     uv run alembic upgrade head
+-- The migration creates the INSERT-only gateway_audit role if it does not exist.
