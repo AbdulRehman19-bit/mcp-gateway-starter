@@ -28,6 +28,33 @@ hidden in data it read), a malicious or compromised client, a curious insider.
 - Startup refuses a DB role with superuser, create-role/db, replication, bypass-RLS or any
   INSERT/UPDATE/DELETE/TRUNCATE grant.
 
+## Phase 3 authentication (resource server only)
+- Tokens: RS256/ES256 only, algorithm taken from our allow-list (never the token), signature,
+  `iss`, exact `aud`, `exp`, `iat`, `sub` required, `nbf` enforced, 30 s skew, 8 KB cap, `kid`
+  required. `alg: none`, HS256-with-public-key and key/alg mismatches are denied (tested).
+- Keys: JWKS and issuer URLs must be https (http only on loopback), no credentials in the URL,
+  no private/link-local IP literals; no redirects, 10 s total deadline, 256 KB streamed cap;
+  cached 5 min; an unknown `kid` refreshes at most once per 60 s; unreachable and >10 min
+  stale keys deny.
+- Sessions: the HTTP transport is stateless. Every request is authenticated and its identity
+  resolved from its own token, and expiry is re-checked at call time. (Stateful mode let a
+  tool call inherit the identity of the request that opened the session, so a downgraded or
+  expired token kept its old role; a regression test pins this.)
+- Role: only from token scopes via `scope_to_role`. No mapped scope, or scopes mapping to more
+  than one role, is denied (roles are not strictly ordered, so we do not guess). Tool arguments
+  and headers never choose a role.
+- Every request carries its own identity (contextvar set by the SDK's bearer middleware);
+  no identity means deny. Audit records carry `subject` and `role`; tokens are never logged.
+- stdio remains the only no-token mode: the local user is trusted and gets `GATEWAY_ROLE`.
+  The http transport refuses to start without `OAUTH_ISSUER` and `OAUTH_JWKS_URL`.
+- Residual: the dev Keycloak realm uses the password grant and lets any client request any
+  optional scope. Production must bind scopes to users/roles at the IdP. Revocation is only
+  as fast as token expiry (5 min in the dev realm). Unmapped-scope tokens get 401, not 403.
+- Residual: requests with a missing or non-Bearer Authorization header are rejected by the SDK
+  (401) before our verifier runs, so they are not audited; failed-auth audit lines are not
+  rate limited. With `GATEWAY_HOST=0.0.0.0` the SDK's DNS-rebinding protection is off, so put
+  TLS and a trusted proxy in front.
+
 ## Phase 2 safety layer (policy enforcement in `sqlguard/analyze.py`)
 - Every query is re-qualified by sqlglot against the role's allowed columns and the SQL that
   runs is regenerated from the validated AST. Tables outside the policy (including

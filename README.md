@@ -27,7 +27,18 @@ denied, `deny_columns` are unreachable and `mask_columns` come back as `***`.
 Set `TARGET_DB_RO_URL` (see `.env.example`), run `docker compose up -d db`, then the Inspector
 command above. If your DB volume predates Phase 2, run
 `docker compose down -v && docker compose up -d db` so `gateway_ro` gets `SELECT (phone)`.
-The http transport is refused until OAuth lands; for local testing use `--insecure-dev`.
+
+### HTTP + OAuth (Keycloak)
+```bash
+docker compose --profile auth up -d keycloak     # imports docker/keycloak/realm-mcp-gateway.json
+uv run mcp-gateway --transport http              # needs OAUTH_ISSUER / OAUTH_JWKS_URL (.env.example)
+TOKEN=$(curl -s http://localhost:8080/realms/mcp-gateway/protocol/openid-connect/token \
+  -d grant_type=password -d client_id=mcp-gateway-dev \
+  -d username=alice -d password=alice-dev-only -d scope=db:read | python -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+```
+Send it as `Authorization: Bearer $TOKEN` to `http://127.0.0.1:8000/mcp`. Dev users:
+alice (`db:read` -> analyst), bob (`db:write` -> operator), carol (`approvals:decide` -> approver).
+Dev only: the realm enables the password grant. A token must carry exactly one mapped scope.
 
 ## Docs
 - [Architecture](docs/ARCHITECTURE.md) · [Threat model](docs/THREAT_MODEL.md) · [Roadmap](docs/ROADMAP.md)

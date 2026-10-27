@@ -31,12 +31,15 @@ services:
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
     profiles: ["auth"]
-    command: start-dev
+    command: start-dev --import-realm
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: admin-dev-only
     ports:
       - "8080:8080"
+    volumes:
+      # Dev-only realm: users alice/bob/carol, password grant enabled. Never use in production.
+      - ./docker/keycloak:/opt/keycloak/data/import:ro
 
 volumes:
   pgdata:

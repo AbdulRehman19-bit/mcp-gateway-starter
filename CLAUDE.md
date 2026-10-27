@@ -102,7 +102,7 @@ Every stage writes an audit record, **including denials and errors**.
 7. If a requirement is ambiguous or a design choice affects security, **ask** instead of guessing.
 
 ## Current phase
-Phase 2 — safety layer (policy-aware sqlguard, column deny/mask, read-only switches). See `docs/ROADMAP.md` for the phase list and acceptance criteria.
+Phase 3 — authentication (Streamable HTTP, JWT validation, Keycloak, scope -> role). See `docs/ROADMAP.md` for the phase list and acceptance criteria.
 Update this line when a phase is completed.
 
 ## References
