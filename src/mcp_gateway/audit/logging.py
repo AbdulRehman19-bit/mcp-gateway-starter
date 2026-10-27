@@ -54,10 +54,12 @@ def audit(
     args: dict[str, Any],
     started: float,
     reason: str = "",
+    role: str = "",
 ) -> None:
     structlog.get_logger("audit").info(
         "tool_call",
         request_id=request_id,
+        role=role,
         tool=tool,
         decision=decision,
         args=redact_args(args),

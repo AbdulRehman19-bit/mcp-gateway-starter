@@ -9,6 +9,7 @@ import base64
 import datetime as dt
 import decimal
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,7 +18,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-ALLOWED_SCHEMAS = frozenset({"public"})
+from mcp_gateway.policy.evaluator import Catalog
+
 MAX_RESPONSE_CHARS = 1_000_000
 
 
@@ -112,7 +114,10 @@ class PostgresReadConnector:
                 await conn.execute(text("SET TRANSACTION READ ONLY"))
                 # SET does not take bind params; set_config does. Value is an int we own.
                 await conn.execute(
-                    text("SELECT set_config('statement_timeout', :ms, true)"),
+                    text(
+                        "SELECT set_config('statement_timeout', :ms, true), "
+                        "set_config('search_path', 'public', true)"
+                    ),
                     {"ms": str(int(self._timeout_ms))},
                 )
                 # text() treats ":name" as a bind; escape colons for caller-supplied SQL.
@@ -160,26 +165,23 @@ class PostgresReadConnector:
     async def run_query(self, sql: str, *, limit: int | None = None) -> QueryResult:
         return await self._run(sql, {}, limit=limit, raw=True)
 
-    async def list_tables(self) -> list[dict[str, str]]:
-        # information_schema only shows objects the role has privileges on.
-        res = await self._run(
-            "SELECT table_schema, table_name, table_type FROM information_schema.tables "
-            "WHERE table_schema = ANY(:schemas) ORDER BY table_schema, table_name",
-            {"schemas": sorted(ALLOWED_SCHEMAS)},
-        )
-        return [{"schema": r[0], "table": r[1], "type": r[2]} for r in res.rows]
+    async def load_catalog(self, schemas: Iterable[str]) -> Catalog:
+        """Columns visible to the read-only role in the given schemas.
 
-    async def describe_table(self, schema: str, table: str) -> list[dict[str, Any]]:
-        if schema not in ALLOWED_SCHEMAS:
-            raise ConnectorError("Unknown table.", f"schema not allowed: {schema!r}")
+        information_schema only lists objects the role has privileges on, so this is the DB's
+        own ceiling; policy can only narrow it. Read once at startup: a column added later is
+        simply unknown to the analyzer and therefore denied (fail closed).
+        """
         res = await self._run(
-            "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
-            "WHERE table_schema = :schema AND table_name = :table ORDER BY ordinal_position",
-            {"schema": schema, "table": table},
+            "SELECT table_schema, table_name, column_name, data_type "
+            "FROM information_schema.columns WHERE table_schema = ANY(:schemas) "
+            "ORDER BY table_schema, table_name, ordinal_position",
+            {"schemas": sorted(set(schemas))},
         )
-        if not res.rows:
-            raise ConnectorError("Unknown table.", f"no visible columns for {schema}.{table}")
-        return [{"column": r[0], "type": r[1], "nullable": r[2] == "YES"} for r in res.rows]
+        catalog: Catalog = {}
+        for schema, table, column, data_type in res.rows:
+            catalog.setdefault((schema, table), {})[column] = data_type
+        return catalog
 
 
 __all__ = ["ConnectorError", "PostgresReadConnector", "QueryResult"]

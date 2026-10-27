@@ -9,6 +9,7 @@ import argparse
 import asyncio
 from typing import Any
 
+import structlog
 from mcp.server.fastmcp import FastMCP
 
 from mcp_gateway import __version__
@@ -16,6 +17,7 @@ from mcp_gateway.audit.logging import configure_logging
 from mcp_gateway.config import Settings
 from mcp_gateway.connectors.postgres import ConnectorError, PostgresReadConnector
 from mcp_gateway.policy import load_policy
+from mcp_gateway.policy.evaluator import Catalog, allowed_tables, effective_read_only
 from mcp_gateway.tools.handlers import ToolFailure, ToolService
 
 mcp = FastMCP("mcp-gateway")
@@ -55,11 +57,12 @@ async def run_query(sql: str, limit: int | None = None) -> dict[str, Any]:
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
-async def _check_role(url: str, limits: dict[str, int]) -> None:
+async def _startup_catalog(url: str, limits: dict[str, int], schemas: set[str]) -> Catalog:
     # Throwaway connector: asyncpg pools are bound to the loop that created them.
     probe = PostgresReadConnector.from_url(url, **limits)
     try:
         await probe.verify_read_only_role()
+        return await probe.load_catalog(schemas)
     except ConnectorError as exc:
         raise SystemExit(f"refusing to start: {exc.safe_message}") from exc
     finally:
@@ -94,9 +97,18 @@ def main() -> None:
         "max_rows": policy.defaults.max_rows,
         "statement_timeout_ms": policy.defaults.statement_timeout_ms,
     }
-    asyncio.run(_check_role(url, limits))
+    role = settings.gateway_role
+    if role not in policy.roles:  # fail closed: unknown role never starts
+        raise SystemExit(f"GATEWAY_ROLE '{role}' is not defined in the policy")
+    schemas = {s for r in policy.roles.values() for s in r.schemas}
+    catalog = asyncio.run(_startup_catalog(url, limits, schemas))
+    allowed = allowed_tables(policy, role, catalog)
+    read_only = effective_read_only(policy, role, settings.gateway_read_only)
+    structlog.get_logger("startup").info(
+        "gateway_ready", role=role, read_only=read_only, tables=len(allowed)
+    )
     global _service
-    _service = ToolService(PostgresReadConnector.from_url(url, **limits))
+    _service = ToolService(PostgresReadConnector.from_url(url, **limits), policy, role, allowed)
 
     if transport == "stdio":
         mcp.run(transport="stdio")

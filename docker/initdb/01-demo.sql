@@ -42,7 +42,9 @@ INSERT INTO orders (customer_id, total_cents, status) VALUES
 GRANT CONNECT ON DATABASE demo TO gateway_ro, gateway_rw;
 GRANT USAGE ON SCHEMA public TO gateway_ro, gateway_rw;
 GRANT SELECT ON orders, customers TO gateway_ro;
-GRANT SELECT (id, created_at) ON users TO gateway_ro;   -- column-level: no email/password_hash
+-- column-level: no email/password_hash. phone is granted so policy can mask it to "***"
+-- (the mask is applied in the rewritten SQL; the DB never needs to hide it from this role).
+GRANT SELECT (id, phone, created_at) ON users TO gateway_ro;
 
 -- Read-write role: limited UPDATE on specific columns only.
 GRANT SELECT ON orders, customers TO gateway_rw;

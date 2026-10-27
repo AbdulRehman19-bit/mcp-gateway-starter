@@ -30,10 +30,30 @@ async def test_three_tools_over_stdio() -> None:
 
         out = await s.call_tool("describe_table", {"table": "users"})
         body = json.loads(out.content[0].text)  # type: ignore[union-attr]
-        assert {c["column"] for c in body["columns"]} == {"id", "created_at"}
+        cols = {c["column"]: c["masked"] for c in body["columns"]}
+        assert cols == {"id": False, "phone": True, "created_at": False}
 
         out = await s.call_tool("run_query", {"sql": "SELECT count(*) AS n FROM orders"})
         assert json.loads(out.content[0].text)["rows"] == [[3]]  # type: ignore[union-attr]
 
-        out = await s.call_tool("run_query", {"sql": "SELECT 1; DROP TABLE orders"})
-        assert out.isError
+        # masking happens in the SQL: the real phone numbers never leave the database
+        out = await s.call_tool("run_query", {"sql": "SELECT id, phone FROM users ORDER BY id"})
+        body = json.loads(out.content[0].text)  # type: ignore[union-attr]
+        assert body["rows"] == [[1, "***"], [2, "***"]]
+        out = await s.call_tool("run_query", {"sql": "SELECT * FROM users ORDER BY id"})
+        assert "+92" not in out.content[0].text  # type: ignore[union-attr]
+
+        out = await s.call_tool("run_query", {"sql": "SELECT id FROM orders LIMIT 99999999"})
+        assert not out.isError
+
+        for bad in (
+            "SELECT 1; DROP TABLE orders",
+            "SELECT email FROM users",
+            "SELECT users FROM users",
+            "SELECT * FROM pg_roles",
+            "SELECT id FROM users WHERE phone LIKE '+92%'",
+            "SELECT pg_sleep(5)",
+        ):
+            out = await s.call_tool("run_query", {"sql": bad})
+            assert out.isError, bad
+            assert "email" not in out.content[0].text.lower()  # type: ignore[union-attr]

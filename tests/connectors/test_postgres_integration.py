@@ -19,21 +19,15 @@ async def conn() -> AsyncIterator[PostgresReadConnector]:
     await c.close()
 
 
-async def test_list_tables(conn: PostgresReadConnector) -> None:
-    names = {t["table"] for t in await conn.list_tables()}
-    assert names == {"customers", "orders", "users"}
+async def test_catalog_lists_only_granted_tables_and_columns(conn: PostgresReadConnector) -> None:
+    catalog = await conn.load_catalog(["public"])
+    assert {t for _, t in catalog} == {"customers", "orders", "users"}
+    # DB grants are the ceiling: email/password_hash are never granted to gateway_ro.
+    assert set(catalog[("public", "users")]) == {"id", "phone", "created_at"}
 
 
-async def test_describe_users_hides_ungranted_columns(conn: PostgresReadConnector) -> None:
-    cols = {c["column"] for c in await conn.describe_table("public", "users")}
-    assert cols == {"id", "created_at"}
-
-
-async def test_describe_unknown_and_bad_schema(conn: PostgresReadConnector) -> None:
-    with pytest.raises(ConnectorError):
-        await conn.describe_table("public", "nope")
-    with pytest.raises(ConnectorError):
-        await conn.describe_table("pg_catalog", "pg_class")
+async def test_catalog_ignores_other_schemas(conn: PostgresReadConnector) -> None:
+    assert await conn.load_catalog(["nonexistent"]) == {}
 
 
 async def test_select_rows(conn: PostgresReadConnector) -> None:
