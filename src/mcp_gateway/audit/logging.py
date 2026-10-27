@@ -1,0 +1,70 @@
+"""Structured JSON audit logging with argument redaction (rule 8).
+
+Phase 1: logs only. The audit_log table arrives in Phase 4.
+"""
+
+import hashlib
+import logging
+import sys
+import time
+import uuid
+from typing import Any
+
+import structlog
+
+_SENSITIVE_KEYS = frozenset({"password", "token", "secret", "authorization", "dsn", "url"})
+
+
+def configure_logging(level: str = "INFO") -> None:
+    # stdout is the MCP stdio channel, so logs MUST go to stderr.
+    logging.basicConfig(stream=sys.stderr, level=level.upper(), format="%(message)s", force=True)
+    structlog.configure(
+        processors=[
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.JSONRenderer(),
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+    )
+
+
+def redact_args(args: dict[str, Any]) -> dict[str, Any]:
+    """Never log SQL text or secrets verbatim: SQL becomes a hash + length."""
+    out: dict[str, Any] = {}
+    for key, value in args.items():
+        if any(k in key.lower() for k in _SENSITIVE_KEYS):
+            out[key] = "[redacted]"
+        elif key == "sql" and isinstance(value, str):
+            out[key] = {
+                "sha256": hashlib.sha256(value.encode()).hexdigest()[:16],
+                "length": len(value),
+            }
+        elif isinstance(value, str) and len(value) > 128:
+            out[key] = value[:128] + "...[truncated]"
+        else:
+            out[key] = value
+    return out
+
+
+def audit(
+    *,
+    request_id: str,
+    tool: str,
+    decision: str,
+    args: dict[str, Any],
+    started: float,
+    reason: str = "",
+) -> None:
+    structlog.get_logger("audit").info(
+        "tool_call",
+        request_id=request_id,
+        tool=tool,
+        decision=decision,
+        args=redact_args(args),
+        reason=reason,
+        duration_ms=round((time.monotonic() - started) * 1000, 2),
+    )
+
+
+def new_request_id() -> str:
+    return uuid.uuid4().hex
