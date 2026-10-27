@@ -19,10 +19,14 @@ uv run pytest -q
 npx @modelcontextprotocol/inspector uv run mcp-gateway --transport stdio
 ```
 
-## Phase 1 tools
+## Tools
 `list_tables`, `describe_table` and `run_query` (single SELECT, row and size capped, statement
-timeout) over stdio, using the SELECT-only `gateway_ro` role. Set `TARGET_DB_RO_URL` (see
-`.env.example`), run `docker compose up -d db`, then the Inspector command above.
+timeout) over stdio, using the SELECT-only `gateway_ro` role. What each call may see is decided
+by the policy for `GATEWAY_ROLE` (default `analyst`): tables and columns outside it are
+denied, `deny_columns` are unreachable and `mask_columns` come back as `***`.
+Set `TARGET_DB_RO_URL` (see `.env.example`), run `docker compose up -d db`, then the Inspector
+command above. If your DB volume predates Phase 2, run
+`docker compose down -v && docker compose up -d db` so `gateway_ro` gets `SELECT (phone)`.
 The http transport is refused until OAuth lands; for local testing use `--insecure-dev`.
 
 ## Docs

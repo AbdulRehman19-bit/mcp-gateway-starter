@@ -20,15 +20,28 @@ hidden in data it read), a malicious or compromised client, a curious insider.
 | 10 | Misconfigured policy widens access | Strict schema (`extra=forbid`), fail closed on load error, policy review in PRs | Phase 0 |
 
 ## Phase 1 residual risks (read-only server, no auth)
-- `run_query` is not yet restricted to policy tables/schemas: it can read `pg_catalog` and any
-  schema the DB role can see. The role's grants are the only limit until Phase 2.
-- No identity: audit records carry no subject until Phase 3. The http transport refuses to start
-  without `--insecure-dev` on a loopback host.
+- No identity: the role comes from server config (`GATEWAY_ROLE`), not a token, until Phase 3.
+  Audit records carry that role but no subject. The http transport refuses to start without
+  `--insecure-dev` on a loopback host.
 - `run_query` denies unknown functions (timeout overrides, advisory locks, `dblink`, `lo_*`).
   Responses are capped by rows and ~1 MB, but one huge value is still read into memory.
 - Startup refuses a DB role with superuser, create-role/db, replication, bypass-RLS or any
   INSERT/UPDATE/DELETE/TRUNCATE grant.
-- `UNION`/`INTERSECT` are denied (root must be a plain SELECT) until Phase 2.
+
+## Phase 2 safety layer (policy enforcement in `sqlguard/analyze.py`)
+- Every query is re-qualified by sqlglot against the role's allowed columns and the SQL that
+  runs is regenerated from the validated AST. Tables outside the policy (including
+  `pg_catalog`, `information_schema`, other schemas), table functions, `LATERAL`/`VALUES`/
+  `UNNEST`, recursive CTEs and whole-row references (`SELECT users FROM users`) are denied.
+- Denied columns are absent from the schema the analyzer sees, so they cannot be referenced in
+  any clause. `SELECT *` is expanded to allowed columns only.
+- Masked columns are rewritten to `'***'` in the outermost projection; any other use
+  (predicate, join, aggregate, function, subquery) is denied, which closes oracle attacks.
+- `LIMIT` is always replaced by `min(requested, max_rows)`; `LIMIT ALL`, `FETCH FIRST` and
+  negative or non-literal limits become the cap.
+- Residual: the catalog is read once at startup, so a column added later is unknown and
+  therefore denied until restart. Masked values are text (`'***'`) whatever the column type.
+  An alias shared by several tables over-denies rather than risk a leak.
 
 ## Out of scope (v1)
 Multi-tenant isolation, network-level DDoS, compromised host or IdP.
