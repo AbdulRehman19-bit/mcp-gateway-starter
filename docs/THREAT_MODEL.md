@@ -39,6 +39,12 @@ hidden in data it read), a malicious or compromised client, a curious insider.
   (predicate, join, aggregate, function, subquery) is denied, which closes oracle attacks.
 - `LIMIT` is always replaced by `min(requested, max_rows)`; `LIMIT ALL`, `FETCH FIRST` and
   negative or non-literal limits become the cap.
+- Functions are default-deny by type and name (no `version()`, `current_user`, `repeat()`,
+  `generate_series()`, `pg_*`, `set_config`); casts only to a short list of plain types (so
+  no `::regclass` existence oracle). Column alias lists on tables (`users AS u(a,b,c)`),
+  `NATURAL JOIN`, `TABLESAMPLE`, more than 4 joins and deep nesting are denied.
+  `statement_timeout` remains the backstop for cost.
+- Residual: `(SELECT ...) UNION (SELECT ...)` with parenthesised branches is denied (usability).
 - Residual: the catalog is read once at startup, so a column added later is unknown and
   therefore denied until restart. Masked values are text (`'***'`) whatever the column type.
   An alias shared by several tables over-denies rather than risk a leak.
