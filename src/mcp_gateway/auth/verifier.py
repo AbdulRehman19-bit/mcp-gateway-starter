@@ -14,6 +14,11 @@ from mcp_gateway.auth.jwks import JwksKeySource
 from mcp_gateway.auth.roles import resolve_role
 from mcp_gateway.auth.validator import TokenError, peek_header, validate_token
 from mcp_gateway.policy import Policy
+from mcp_gateway.ratelimit import Limit, RateLimiter
+
+# Failed authentications are audited, but a flood of garbage tokens must not become an
+# unbounded stream of audit rows: beyond this budget they are counted and summarised instead.
+_DENY_AUDIT_LIMIT = Limit(per_minute=600, burst=100)
 
 
 class JwtTokenVerifier:
@@ -26,17 +31,27 @@ class JwtTokenVerifier:
         audience: str,
         leeway_seconds: int = 30,
         auditor: Auditor | None = None,
+        deny_limiter: RateLimiter | None = None,
     ) -> None:
         self._policy = policy
         self._keys = keys
         self._issuer = issuer
         self._audience = audience
         self._leeway = leeway_seconds
-        self._auditor = auditor or Auditor()
+        self._auditor = Auditor() if auditor is None else auditor
+        self._deny_limiter = RateLimiter(max_keys=8) if deny_limiter is None else deny_limiter
+        self._suppressed = 0
 
     async def _audit(
         self, rid: str, started: float, decision: str, reason: str, subject: str, role: str = ""
     ) -> None:
+        if decision != "allow":
+            if not self._deny_limiter.check("auth-deny", _DENY_AUDIT_LIMIT).allowed:
+                self._suppressed += 1  # still denied, just not individually recorded
+                return
+            if self._suppressed:
+                reason = f"{reason} (+{self._suppressed} similar denials not recorded)"
+                self._suppressed = 0
         await self._auditor.record(
             request_id=rid, tool="authenticate", decision=decision, args={}, started=started,
             reason=reason, subject=subject, role=role,
