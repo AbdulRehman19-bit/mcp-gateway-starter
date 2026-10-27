@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,3 +16,5 @@ class Settings(BaseSettings):
     # Global kill switch: when true, every role is forced read-only. Default is safe.
     gateway_read_only: bool = True
     gateway_log_level: str = "INFO"
+    # Target DB, SELECT-only role. SecretStr so the DSN never shows up in repr or logs.
+    target_db_ro_url: SecretStr | None = None
