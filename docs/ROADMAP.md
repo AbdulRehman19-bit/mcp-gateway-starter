@@ -3,6 +3,10 @@
 Each phase ends with a tagged release (`v0.1`, `v0.2`, ...), green CI, and an updated
 "Current phase" line in `CLAUDE.md`. Use `/plan-phase <n>` to start each one.
 
+**Status: all phases complete.** Phase 0 = `v0.1`, Phase 1 = `v0.2`, Phase 2 = `v0.3`,
+Phase 3 = `v0.4`, Phase 4 = `v0.5`, Phase 5 = `v1.0`. Open items live in the residual-risk
+register in [THREAT_MODEL.md](THREAT_MODEL.md) §5.
+
 ## Phase 0 — Setup (day 1–2)
 - Repo, uv project, Docker Compose Postgres with demo data and RO/RW roles, CI, CLAUDE.md
 - **Done when:** `uv run pytest` and CI are green; `docker compose up -d db` works;

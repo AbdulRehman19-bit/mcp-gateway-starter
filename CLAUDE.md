@@ -102,7 +102,8 @@ Every stage writes an audit record, **including denials and errors**.
 7. If a requirement is ambiguous or a design choice affects security, **ask** instead of guessing.
 
 ## Current phase
-Phase 4 — approvals and audit (risk classifier, update/delete_record, approval queue, audit_log). See `docs/ROADMAP.md` for the phase list and acceptance criteria.
+Phase 5 complete — v1.0 (GitHub connector, rate limiting, one-command demo, consolidated threat model).
+Future work is post-1.0; see the residual-risk register in `docs/THREAT_MODEL.md` §5. See `docs/ROADMAP.md` for the phase list and acceptance criteria.
 Update this line when a phase is completed.
 
 ## References
