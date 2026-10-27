@@ -102,7 +102,7 @@ Every stage writes an audit record, **including denials and errors**.
 7. If a requirement is ambiguous or a design choice affects security, **ask** instead of guessing.
 
 ## Current phase
-Phase 0 — scaffolding. See `docs/ROADMAP.md` for the phase list and acceptance criteria.
+Phase 1 — core read-only server (list_tables, describe_table, run_query over stdio). See `docs/ROADMAP.md` for the phase list and acceptance criteria.
 Update this line when a phase is completed.
 
 ## References

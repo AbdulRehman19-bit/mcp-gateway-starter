@@ -38,4 +38,5 @@ Audit logger (audit/) records every stage: allow, deny, error, approval events.
 
 ## Transports
 - **stdio:** local development and the Inspector. No OAuth (the local user is trusted).
-- **Streamable HTTP:** remote use. OAuth required.
+- **Streamable HTTP:** remote use. OAuth required; until Phase 3 the server refuses it unless
+  `--insecure-dev` is passed on a loopback host.

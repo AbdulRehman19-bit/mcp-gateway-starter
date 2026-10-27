@@ -19,6 +19,12 @@ uv run pytest -q
 npx @modelcontextprotocol/inspector uv run mcp-gateway --transport stdio
 ```
 
+## Phase 1 tools
+`list_tables`, `describe_table` and `run_query` (single SELECT, row and size capped, statement
+timeout) over stdio, using the SELECT-only `gateway_ro` role. Set `TARGET_DB_RO_URL` (see
+`.env.example`), run `docker compose up -d db`, then the Inspector command above.
+The http transport is refused until OAuth lands; for local testing use `--insecure-dev`.
+
 ## Docs
 - [Architecture](docs/ARCHITECTURE.md) · [Threat model](docs/THREAT_MODEL.md) · [Roadmap](docs/ROADMAP.md)
 - [Git workflow](docs/GIT_WORKFLOW.md) · [Using Claude Code](docs/CLAUDE_CODE_GUIDE.md)
