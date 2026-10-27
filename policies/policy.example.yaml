@@ -1,0 +1,58 @@
+# Example policy. Copy to policies/dev.local.yaml for local changes (git-ignored).
+# Principle: default deny. Anything not listed here is not allowed.
+version: 1
+
+defaults:
+  read_only: true            # roles are read-only unless they say otherwise
+  max_rows: 500              # hard cap on rows returned by run_query
+  statement_timeout_ms: 5000
+
+# Which tools exist and how risky they are.
+risk:
+  low: [list_tables, describe_table, run_query]
+  medium: [update_record]            # bounded write: single row, by primary key
+  high: [delete_record, bulk_update] # always needs human approval
+
+approvals:
+  ttl_minutes: 30
+  require_different_approver: true
+
+# OAuth scope -> role. The role is derived from the validated token, never from tool args.
+scope_to_role:
+  "db:read": analyst
+  "db:write": operator
+  "approvals:decide": approver
+
+roles:
+  analyst:
+    read_only: true
+    tools: [list_tables, describe_table, run_query]
+    schemas:
+      public:
+        tables:
+          orders:
+            columns: ["*"]
+          customers:
+            columns: [id, name, country, created_at]
+          users:
+            columns: ["*"]
+            deny_columns: [email, password_hash]   # never readable
+            mask_columns: [phone]                  # returned as "***"
+
+  operator:
+    read_only: false
+    tools: [list_tables, describe_table, run_query, update_record]
+    approval_required: []        # medium-risk writes are allowed directly
+    schemas:
+      public:
+        tables:
+          orders:
+            columns: ["*"]
+            writable_columns: [status, notes]   # update_record may only touch these
+          customers:
+            columns: [id, name, country, created_at]
+
+  approver:
+    read_only: true
+    tools: [list_approvals, decide_approval]
+    schemas: {}

@@ -1,0 +1,17 @@
+"""Runtime settings, loaded from environment variables (see .env.example)."""
+
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    gateway_transport: str = "stdio"
+    gateway_host: str = "127.0.0.1"
+    gateway_port: int = 8000
+    gateway_policy_path: Path = Path("policies/policy.example.yaml")
+    # Global kill switch: when true, every role is forced read-only. Default is safe.
+    gateway_read_only: bool = True
+    gateway_log_level: str = "INFO"

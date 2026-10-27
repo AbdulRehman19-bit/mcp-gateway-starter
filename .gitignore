@@ -1,0 +1,35 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Local policy and data
+policies/*.local.yaml
+policies/prod*.yaml
+data/private/
+*.log
+
+# Claude Code local-only files (settings.json and commands ARE committed)
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
