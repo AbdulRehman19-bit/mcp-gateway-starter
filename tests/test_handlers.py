@@ -4,6 +4,7 @@ from typing import Any
 import pytest
 import structlog
 
+from mcp_gateway.auth.roles import Identity
 from mcp_gateway.connectors.postgres import ConnectorError, QueryResult
 from mcp_gateway.policy import load_policy
 from mcp_gateway.policy.evaluator import Catalog, allowed_tables
@@ -29,9 +30,42 @@ class FakeConnector:
         return QueryResult(columns=["a"], rows=[[1]], truncated=False)
 
 
-def svc(c: FakeConnector, role: str = "analyst") -> ToolService:
-    allowed = allowed_tables(POLICY, role, CATALOG)
-    return ToolService(c, POLICY, role, allowed)  # type: ignore[arg-type]
+ALLOWED_BY_ROLE = {r: allowed_tables(POLICY, r, CATALOG) for r in POLICY.roles}
+
+
+def svc(
+    c: FakeConnector, role: str = "analyst", *, identity: Identity | bool | None = True
+) -> ToolService:
+    ident = Identity("user-1", role, frozenset()) if identity is True else identity
+    return ToolService(c, POLICY, ALLOWED_BY_ROLE, lambda: ident)  # type: ignore[arg-type,return-value]
+
+
+async def test_no_identity_is_denied_everywhere_and_audited() -> None:
+    c = FakeConnector()
+    s = svc(c, identity=None)
+    for call in (s.list_tables(), s.describe_table("orders"), s.run_query("SELECT 1")):
+        with structlog.testing.capture_logs() as logs, pytest.raises(ToolFailure):
+            await call
+        assert logs[0]["decision"] == "deny"
+        assert logs[0]["reason"] == "no identity"
+    assert c.calls == []
+
+
+async def test_identity_is_per_request_not_shared() -> None:
+    current: list[Identity | None] = [Identity("alice", "analyst", frozenset())]
+    s = ToolService(FakeConnector(), POLICY, ALLOWED_BY_ROLE, lambda: current[0])  # type: ignore[arg-type]
+    with structlog.testing.capture_logs() as logs:
+        await s.list_tables()
+        current[0] = Identity("bob", "operator", frozenset())
+        names = {t["table"] for t in (await s.list_tables())["tables"]}
+    assert [(e["subject"], e["role"]) for e in logs] == [("alice", "analyst"), ("bob", "operator")]
+    assert names == {"orders", "customers"}  # operator's view, not alice's
+
+
+async def test_audit_carries_subject() -> None:
+    with structlog.testing.capture_logs() as logs:
+        await svc(FakeConnector()).list_tables()
+    assert logs[0]["subject"] == "user-1"
 
 
 async def test_run_query_allow_executes_rewritten_sql() -> None:

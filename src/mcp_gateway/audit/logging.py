@@ -55,10 +55,12 @@ def audit(
     started: float,
     reason: str = "",
     role: str = "",
+    subject: str = "",
 ) -> None:
     structlog.get_logger("audit").info(
         "tool_call",
         request_id=request_id,
+        subject=subject,
         role=role,
         tool=tool,
         decision=decision,
