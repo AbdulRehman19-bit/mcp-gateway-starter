@@ -37,7 +37,13 @@ def validate_jwks_url(url: str, *, http_hosts: frozenset[str] = frozenset()) -> 
     host = parsed.hostname
     if not host or parsed.username or parsed.password:
         raise ValueError("URL must have a host and no credentials")
-    if parsed.scheme == "http" and (host in _LOOPBACK or host in http_hosts):
+    if parsed.scheme == "http" and host in http_hosts:
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            return url  # a private DNS name (e.g. the `keycloak` compose service)
+        raise ValueError("the plain-http opt-in takes hostnames, not IP addresses")
+    if parsed.scheme == "http" and host in _LOOPBACK:
         return url
     if parsed.scheme != "https":
         raise ValueError("URL must be https (http allowed only on loopback)")

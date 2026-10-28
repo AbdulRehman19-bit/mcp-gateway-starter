@@ -10,5 +10,6 @@ __pycache__
 .ruff_cache
 tests
 docs
+policies/*.local.yaml
 .github
 .claude
