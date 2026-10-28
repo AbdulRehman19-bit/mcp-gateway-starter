@@ -92,11 +92,16 @@ class Auditor:
         subject: str = "",
         risk: str = "",
         critical: bool = False,
+        persist: bool = True,
     ) -> None:
+        """Always write the JSON log line. `persist=False` skips only the database row; it is
+        used to budget floods (failed logins, rate-limit denials) without losing the log trail."""
         rec = audit(
             request_id=request_id, tool=tool, decision=decision, args=args, started=started,
             reason=reason, role=role, subject=subject, risk=risk,
         )  # fmt: skip
+        if not persist and not critical:
+            return
         if self._sink is None:
             if critical:
                 raise AuditUnavailable("no audit sink configured")

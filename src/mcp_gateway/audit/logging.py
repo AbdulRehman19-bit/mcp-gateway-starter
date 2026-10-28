@@ -36,7 +36,7 @@ def redact_args(args: dict[str, Any]) -> dict[str, Any]:
             out[key] = "[redacted]"
         elif key in ("sql", "body") and isinstance(value, str):
             out[key] = {
-                "sha256": hashlib.sha256(value.encode()).hexdigest()[:16],
+                "sha256": hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()[:16],
                 "length": len(value),
             }
         elif key == "body":  # free text from the caller: never stored, even if malformed

@@ -2,6 +2,15 @@
 
 Returning None makes the SDK answer 401. Denials are audited here with a precise reason;
 the client only ever sees the generic 401. Tokens are never logged.
+
+Audit volume: every outcome is written to the JSON log unthrottled. Database rows are budgeted
+for two flood-prone paths so they cannot be used to bloat or bury the audit table:
+  - denials of tokens that never proved a valid signature (anyone can send garbage): one shared
+    budget; the rest are counted and summarised in the next stored denial's reason;
+  - successful logins: a small per-subject budget (each tool call's own audit row already
+    records who called).
+Denials of tokens WITH a valid signature (wrong audience, no role, ambiguous scopes) are rare,
+come only from holders of real credentials, and are always stored.
 """
 
 import time
@@ -16,9 +25,8 @@ from mcp_gateway.auth.validator import TokenError, peek_header, validate_token
 from mcp_gateway.policy import Policy
 from mcp_gateway.ratelimit import Limit, RateLimiter
 
-# Failed authentications are audited, but a flood of garbage tokens must not become an
-# unbounded stream of audit rows: beyond this budget they are counted and summarised instead.
 _DENY_AUDIT_LIMIT = Limit(per_minute=600, burst=100)
+_ALLOW_AUDIT_LIMIT = Limit(per_minute=12, burst=5)  # per subject
 
 
 class JwtTokenVerifier:
@@ -32,6 +40,7 @@ class JwtTokenVerifier:
         leeway_seconds: int = 30,
         auditor: Auditor | None = None,
         deny_limiter: RateLimiter | None = None,
+        allow_limiter: RateLimiter | None = None,
     ) -> None:
         self._policy = policy
         self._keys = keys
@@ -40,26 +49,42 @@ class JwtTokenVerifier:
         self._leeway = leeway_seconds
         self._auditor = Auditor() if auditor is None else auditor
         self._deny_limiter = RateLimiter(max_keys=8) if deny_limiter is None else deny_limiter
+        self._allow_limiter = (
+            RateLimiter(max_keys=5_000) if allow_limiter is None else allow_limiter
+        )
         self._suppressed = 0
 
     async def _audit(
-        self, rid: str, started: float, decision: str, reason: str, subject: str, role: str = ""
+        self,
+        rid: str,
+        started: float,
+        decision: str,
+        reason: str,
+        subject: str,
+        role: str = "",
+        *,
+        signed: bool = False,
     ) -> None:
-        if decision != "allow":
-            if not self._deny_limiter.check("auth-deny", _DENY_AUDIT_LIMIT).allowed:
-                self._suppressed += 1  # still denied, just not individually recorded
-                return
-            if self._suppressed:
-                reason = f"{reason} (+{self._suppressed} similar denials not recorded)"
-                self._suppressed = 0
+        persist = True
+        if decision == "allow":
+            persist = self._allow_limiter.check(subject, _ALLOW_AUDIT_LIMIT).allowed
+        elif not signed:
+            if self._deny_limiter.check("auth-deny", _DENY_AUDIT_LIMIT).allowed:
+                if self._suppressed:
+                    reason = f"{reason} (+{self._suppressed} similar denials not stored)"
+                    self._suppressed = 0
+            else:
+                self._suppressed += 1  # still logged as JSON, just not stored as a row
+                persist = False
         await self._auditor.record(
             request_id=rid, tool="authenticate", decision=decision, args={}, started=started,
-            reason=reason, subject=subject, role=role,
+            reason=reason, subject=subject, role=role, persist=persist,
         )  # fmt: skip
 
     async def verify_token(self, token: str) -> AccessToken | None:
         rid, started = new_request_id(), time.monotonic()
         subject = ""
+        signed = False  # becomes True once the signature has been verified
         try:
             alg, kid = peek_header(token)
             key = await self._keys.get_key(kid)
@@ -73,15 +98,18 @@ class JwtTokenVerifier:
                 audience=self._audience,
                 leeway_seconds=self._leeway,
             )
-            subject = claims.subject
+            subject, signed = claims.subject, True
             identity = resolve_role(self._policy, claims.subject, claims.scopes)
             if identity is None:
                 raise TokenError("no single role for token scopes")
         except TokenError as exc:
-            await self._audit(rid, started, "deny", exc.reason, subject)
+            await self._audit(
+                rid, started, "deny", exc.reason, subject or exc.subject,
+                signed=signed or exc.signed,
+            )  # fmt: skip
             return None
         except Exception as exc:  # never let a bug authenticate anyone
-            await self._audit(rid, started, "error", type(exc).__name__, subject)
+            await self._audit(rid, started, "error", type(exc).__name__, subject, signed=signed)
             return None
         await self._audit(rid, started, "allow", "", identity.subject, identity.role)
         return AccessToken(

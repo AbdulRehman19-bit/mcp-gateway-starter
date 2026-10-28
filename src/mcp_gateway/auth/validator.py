@@ -21,9 +21,23 @@ _REQUIRED_CLAIMS = ["exp", "iat", "iss", "aud", "sub"]
 class TokenError(Exception):
     """Token rejected. `reason` is for the audit log only; it never contains the token."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, *, signed: bool = False, subject: str = "") -> None:
         super().__init__(reason)
         self.reason = reason
+        # True when the signature was verified before the failure (claims checks come after
+        # signature verification in PyJWT), i.e. the sender holds a genuinely issued token.
+        self.signed = signed
+        # Only ever set when `signed`: the `sub` of a token whose signature verified.
+        self.subject = subject
+
+
+def _signed_error(reason: str, token: str) -> TokenError:
+    """A claims failure on a token whose signature already verified: record who it was."""
+    try:
+        sub = jwt.decode(token, options={"verify_signature": False}).get("sub")
+    except jwt.PyJWTError:
+        sub = None
+    return TokenError(reason, signed=True, subject=sub[:200] if isinstance(sub, str) else "")
 
 
 @dataclass(frozen=True)
@@ -83,13 +97,13 @@ def validate_token(
             options={"require": _REQUIRED_CLAIMS, "verify_signature": True},
         )
     except jwt.ExpiredSignatureError as exc:
-        raise TokenError("expired") from exc
+        raise _signed_error("expired", token) from exc
     except jwt.InvalidAudienceError as exc:
-        raise TokenError("wrong audience") from exc
+        raise _signed_error("wrong audience", token) from exc
     except jwt.InvalidIssuerError as exc:
-        raise TokenError("wrong issuer") from exc
+        raise _signed_error("wrong issuer", token) from exc
     except jwt.MissingRequiredClaimError as exc:
-        raise TokenError(f"missing claim: {exc.claim}") from exc
+        raise _signed_error(f"missing claim: {exc.claim}", token) from exc
     except (jwt.PyJWTError, TypeError, ValueError) as exc:
         # InvalidSignature, ImmatureSignature, InvalidKey (key/alg mismatch), ...
         raise TokenError(f"invalid token: {type(exc).__name__}") from exc

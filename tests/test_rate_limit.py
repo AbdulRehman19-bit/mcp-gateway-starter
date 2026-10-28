@@ -187,7 +187,7 @@ async def test_failed_auth_audit_flood_is_bounded_and_summarised() -> None:
     assert 100 <= len(sink.records) <= 101  # the burst budget, not 1000 rows
     clock.t += 30
     assert await v.verify_token(_garbage()) is None
-    assert "similar denials not recorded" in sink.records[-1]["reason"]
+    assert "similar denials not stored" in sink.records[-1]["reason"]
 
 
 async def test_a_real_login_is_still_audited_during_a_denial_flood() -> None:
@@ -206,3 +206,107 @@ async def test_a_real_login_is_still_audited_during_a_denial_flood() -> None:
         await attacker.verify_token(_garbage())
     assert await user.verify_token(token) is not None
     assert sink.records[-1]["decision"] == "allow"  # successes are never throttled
+
+
+# ---- review fixes: audit budgets never hide the log trail ----------------------------------------
+
+
+async def test_every_denial_is_still_logged_as_json_during_a_flood() -> None:
+    import structlog
+
+    clock, sink = Clock(), MemorySink()
+    v = _verifier(NoKeys(), sink, RateLimiter(clock=clock))
+    with structlog.testing.capture_logs() as logs:
+        for _ in range(500):
+            await v.verify_token(_garbage())
+    assert len(logs) == 500  # nothing is lost from the JSON log
+    assert len(sink.records) < 110  # only the database rows are budgeted
+
+
+async def test_denials_of_validly_signed_tokens_are_always_stored() -> None:
+    now = int(time.time())
+
+    def signed(**over: Any) -> str:
+        claims = {"iss": "i", "aud": "a", "sub": "alice", "iat": now, "exp": now + 300,
+                  "scope": "db:read", **over}  # fmt: skip
+        return jwt.encode(claims, KEY, "RS256", headers={"kid": "k"})
+
+    clock, sink = Clock(), MemorySink()
+    shared = RateLimiter(clock=clock)
+    attacker = _verifier(NoKeys(), sink, shared)
+    user = _verifier(GoodKeys(), sink, shared)
+    for _ in range(500):  # exhaust the unsigned-denial budget
+        await attacker.verify_token(_garbage())
+    before = len(sink.records)
+    bad = [
+        signed(aud="someone-else"),
+        signed(scope="admin"),
+        signed(scope="db:read db:write"),
+        signed(exp=now - 3600),
+        signed(iss="http://evil"),
+    ]
+    for token in bad:
+        assert await user.verify_token(token) is None
+    stored = sink.records[before:]
+    assert len(stored) == len(bad)  # a targeted attack with real credentials leaves a trace
+    assert {r["decision"] for r in stored} == {"deny"}
+    assert all(r["subject"] == "alice" for r in stored)
+
+
+async def test_repeat_logins_are_budgeted_per_subject_but_still_logged() -> None:
+    import structlog
+
+    now = int(time.time())
+    token = jwt.encode(
+        {"iss": "i", "aud": "a", "sub": "alice", "iat": now, "exp": now + 300, "scope": "db:read"},
+        KEY, "RS256", headers={"kid": "k"},
+    )  # fmt: skip
+    sink = MemorySink()
+    v = _verifier(GoodKeys(), sink, RateLimiter())
+    with structlog.testing.capture_logs() as logs:
+        for _ in range(200):
+            assert await v.verify_token(token) is not None
+    assert len(logs) == 200
+    assert 5 <= len(sink.records) <= 8  # a few rows, not one per HTTP request
+
+
+async def test_rate_limit_denials_are_logged_always_but_stored_within_a_budget() -> None:
+    import structlog
+
+    svc, _, _, sink = make()
+    burst = EXAMPLE.limits.tools["run_query"].burst
+    for _ in range(burst):
+        await svc.run_query("SELECT id FROM orders")
+    allowed_rows = len(sink.records)
+    with structlog.testing.capture_logs() as logs:
+        for _ in range(300):
+            with pytest.raises(ToolFailure, match="Rate limit"):
+                await svc.run_query("SELECT id FROM orders")
+    assert len(logs) == 300  # every denial is in the JSON log
+    stored = len(sink.records) - allowed_rows
+    assert 1 <= stored <= 4  # but a hammering user cannot flood the table
+    assert all(r["reason"].startswith("rate_limited") for r in sink.records[allowed_rows:])
+
+
+def test_token_errors_know_whether_the_signature_was_verified() -> None:
+    from mcp_gateway.auth.validator import TokenError, peek_header, validate_token
+
+    now = int(time.time())
+    good = jwt.encode(
+        {"iss": "i", "aud": "OTHER", "sub": "a", "iat": now, "exp": now + 60},
+        KEY, "RS256", headers={"kid": "k"},
+    )  # fmt: skip
+    with pytest.raises(TokenError) as wrong_aud:
+        validate_token(good, KEY.public_key(), alg="RS256", issuer="i", audience="a")
+    assert wrong_aud.value.signed is True
+    forged = jwt.encode(
+        {"iss": "i", "aud": "a", "sub": "a", "iat": now, "exp": now + 60},
+        rsa.generate_private_key(public_exponent=65537, key_size=2048), "RS256",
+        headers={"kid": "k"},
+    )  # fmt: skip
+    with pytest.raises(TokenError) as bad_sig:
+        validate_token(forged, KEY.public_key(), alg="RS256", issuer="i", audience="a")
+    assert bad_sig.value.signed is False
+    with pytest.raises(TokenError) as junk:
+        peek_header("garbage")
+    assert junk.value.signed is False
