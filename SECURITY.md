@@ -27,6 +27,9 @@ Only the latest release receives security fixes.
 
 ## Hardening checklist for operators
 
+- **Never set `OAUTH_JWKS_HTTP_ALLOWED_HOSTS` in production.** It lets the signing keys travel
+  over plain http; anyone on that network could inject a key and forge any token. It exists only
+  for the Compose demo (`keycloak` on a private network) and rejects IP addresses.
 - Run behind TLS; never expose the Compose demo stack.
 - Use your own identity provider; require an exact `aud`; keep access-token lifetimes short.
 - Create the four database roles with real secrets and least privilege (see
