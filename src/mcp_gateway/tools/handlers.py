@@ -9,6 +9,7 @@ Writes are fail-closed on audit: the "allow" record is persisted BEFORE the writ
 it cannot be persisted the write does not happen.
 """
 
+import hashlib
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -38,6 +39,7 @@ from mcp_gateway.ratelimit import Limit, RateLimiter
 from mcp_gateway.risk import classify, needs_approval
 from mcp_gateway.sqlguard import GuardError
 from mcp_gateway.sqlguard.analyze import rewrite_for_policy
+from mcp_gateway.textsafety import escape_invisible_deep
 from mcp_gateway.tools.schemas import (
     DecideApprovalInput,
     DeleteRecordInput,
@@ -54,6 +56,20 @@ from mcp_gateway.tools.schemas import (
 IdentitySource = Callable[[], Identity | None]
 _INTEGER_TYPES = frozenset({"integer", "bigint", "smallint"})
 _AUDIT_DOWN = "Audit unavailable; request refused."
+_RL_AUDIT_LIMIT = Limit(per_minute=6, burst=3)  # stored rate_limited rows per (user, tool)
+
+
+def _body_fingerprint(args: dict[str, Any]) -> dict[str, Any]:
+    """For comments: lets an approver confirm the exact text without trusting its rendering."""
+    body = args.get("body")
+    if not isinstance(body, str):
+        return {}
+    return {
+        "body_sha256": hashlib.sha256(body.encode("utf-8", "surrogatepass")).hexdigest(),
+        "body_chars": len(body),
+    }
+
+
 PAGE_SIZE = 50
 
 
@@ -88,6 +104,8 @@ class ToolService:
         self._pks = primary_keys or {}
         # `is None`, not `or`: an empty RateLimiter is falsy (it has __len__)
         self._limiter = RateLimiter() if limiter is None else limiter
+        self._rl_audit_limiter = RateLimiter(max_keys=5_000)
+        self._upstream_limiter = RateLimiter(max_keys=4)
         self._github = github
         gh_policy = policy.connectors.github
         self._github_repos = frozenset(gh_policy.repos) if gh_policy else frozenset()
@@ -110,6 +128,7 @@ class ToolService:
         reason: str = "",
         *,
         critical: bool = False,
+        persist: bool = True,
     ) -> None:
         try:
             await self._auditor.record(
@@ -123,6 +142,7 @@ class ToolService:
                 subject=ident.subject if ident else "",
                 risk=self._risk(tool),
                 critical=critical,
+                persist=persist,
             )
         except AuditUnavailable as exc:
             raise ToolFailure(_AUDIT_DOWN) from exc
@@ -138,7 +158,10 @@ class ToolService:
         )
         if not decision.allowed:
             reason = f"rate_limited retry_after={decision.retry_after:.1f}s"
-            await self._audit(rid, tool, "deny", args, started, ident, reason)
+            # Always logged as JSON; stored as a row only within a small per-(user, tool)
+            # budget, so a user hammering a limit cannot bloat or bury the audit table.
+            store = self._rl_audit_limiter.check((ident.subject, tool), _RL_AUDIT_LIMIT).allowed
+            await self._audit(rid, tool, "deny", args, started, ident, reason, persist=store)
             raise ToolFailure(f"Rate limit exceeded. Retry in {decision.retry_after_seconds} s.")
 
     async def _authorize(
@@ -438,6 +461,17 @@ class ToolService:
             # Same answer for "unknown" and "not allowed": no probing of private repos.
             await self._audit(rid, tool, "deny", raw, started, ident, "repo not allow-listed")
             raise ToolFailure("Unknown repository.")
+        # One shared bucket for every user: the token and GitHub's quota are shared.
+        gh_policy = self._policy.connectors.github
+        assert gh_policy is not None
+        shared = self._upstream_limiter.check(
+            "github",
+            Limit(per_minute=gh_policy.upstream_per_minute, burst=gh_policy.upstream_burst),
+        )
+        if not shared.allowed:
+            reason = f"upstream budget exhausted retry_after={shared.retry_after:.1f}s"
+            await self._audit(rid, tool, "deny", raw, started, ident, reason)
+            raise ToolFailure(f"GitHub budget exhausted. Retry in {shared.retry_after_seconds} s.")
         return self._github
 
     async def _github_read(
@@ -572,7 +606,11 @@ class ToolService:
                     "requester": r.requester,
                     "requester_role": r.requester_role,
                     "tool": r.tool,
-                    "args": r.args,
+                    # What the requester asked for, as DATA: hidden characters (bidi, zero-width,
+                    # tags) are shown as <U+XXXX>, never executed or followed.
+                    "args": escape_invisible_deep(r.args),
+                    "args_untrusted": True,
+                    **_body_fingerprint(r.args),
                     "created_at": r.created_at.isoformat(),
                     "expires_at": r.expires_at.isoformat(),
                     "own_request": r.requester == ident.subject,

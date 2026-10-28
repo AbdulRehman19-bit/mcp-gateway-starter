@@ -51,8 +51,10 @@ class UpdateRecordInput(_WriteInput):
     @classmethod
     def _bounded_values(cls, v: dict[str, Any]) -> dict[str, Any]:
         for value in v.values():
-            if isinstance(value, str) and len(value) > 10_000:
-                raise ValueError("value too long")
+            if isinstance(value, str):
+                if len(value) > 10_000:
+                    raise ValueError("value too long")
+                _storable_text(value)
         return v
 
 
@@ -88,10 +90,26 @@ class GithubGetIssueInput(_Input):
     number: StrictInt = Field(ge=1, le=10**9)
 
 
+def _storable_text(value: str) -> str:
+    """NUL and lone surrogates cannot be stored (jsonb) or sent; refuse them up front."""
+    if "\x00" in value or any(0xD800 <= ord(ch) <= 0xDFFF for ch in value):
+        raise ValueError("text contains NUL or surrogate characters")
+    return value
+
+
+def _comment_text(value: str) -> str:
+    _storable_text(value)
+    if not value.strip():
+        raise ValueError("comment is blank")  # would burn an approval for nothing
+    return value
+
+
 class GithubAddCommentInput(_WriteInput):
     repo: Repo
     number: StrictInt = Field(ge=1, le=10**9)
-    body: StrictStr = Field(min_length=1, max_length=4_000)
+    body: Annotated[StrictStr, AfterValidator(_comment_text)] = Field(
+        min_length=1, max_length=4_000
+    )
     dry_run: bool = False
     approval_id: ApprovalId | None = None
 

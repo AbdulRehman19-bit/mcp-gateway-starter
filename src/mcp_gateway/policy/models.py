@@ -82,12 +82,23 @@ class GithubPolicy(_Strict):
     # Exact owner/name pairs the gateway may touch. Anything else is denied before any request.
     repos: list[str] = Field(min_length=1, max_length=200)
     max_text_chars: int = Field(default=4_000, ge=100, le=20_000)
+    # One shared bucket for ALL upstream calls: the server-side token and GitHub's own quota are
+    # shared by every user, so a per-user limit alone lets one user starve the rest.
+    upstream_per_minute: int = Field(default=50, ge=1, le=5_000)
+    upstream_burst: int = Field(default=20, ge=1, le=500)
 
     @model_validator(mode="after")
     def _check_repos(self) -> "GithubPolicy":
         for repo in self.repos:
             if not re.fullmatch(REPO_PATTERN, repo) or ".." in repo:
                 raise ValueError(f"invalid repository name: {repo!r}")
+            if any(part in (".", "..") for part in repo.split("/")):
+                raise ValueError(f"invalid repository name: {repo!r}")
+        lowered = [r.lower() for r in self.repos]
+        if len(set(lowered)) != len(lowered):
+            raise ValueError(
+                "duplicate repositories (names are matched exactly; GitHub ignores case)"
+            )
         return self
 
 
